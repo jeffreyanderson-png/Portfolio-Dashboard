@@ -11,10 +11,8 @@ class Transaction(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
 
     # --- Account Trade History Data ---
-    exec_date: date                     # Converted from String during import
+    exec_date: Optional[date] = None    # Converted from String during import
     exec_time: Optional[time] = None    # Converted from String during import
-    
-    # --- CHANGED: Make these Optional ---
     symbol: str                         # The Ticker (e.g., "AMD", "GOOG")
     qty: float
     price: float                        # Price per Share/Contract 
@@ -29,7 +27,6 @@ class Transaction(SQLModel, table=True):
     
     # --- Cash Balance Data ---
     # We use default=0.0 so we don't break if data is missing
-    # Cash Data
     cb_misc_fees: float = Field(default=0.0)
     cb_commissions: float = Field(default=0.0)
     cb_amount: float = Field(default=0.0) # The Net Total of the transaction minus fees
@@ -46,6 +43,10 @@ class Transaction(SQLModel, table=True):
     # --- Metadata ---
     # Good practice to track when you actually imported this row
     imported_at: date = Field(default_factory=date.today)
+
+    # --- VALIDATION FIELDS ---
+    manual_review: bool = Field(default=False)
+    review_reason: Optional[str] = None
  
 class AccountSnapshot(SQLModel, table=True):
     # --- ADD THIS LINE to update the definition if this table is already defined, don't crash.

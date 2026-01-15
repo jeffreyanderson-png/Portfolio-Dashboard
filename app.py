@@ -93,10 +93,11 @@ def main():
                         # C. Show Results
                         st.success("Import Complete!")
                         
-                        col1, col2, col3 = st.columns(3)
+                        col1, col2, col3, col4 = st.columns(4)
                         col1.metric("Trades Added", stats['trades_added'])
                         col2.metric("Snapshots Processed", stats['snapshots_processed'])
                         col3.metric("Positions Added", stats['positions_added'])
+                        col4.metric("Tradses Healed", stats['trades_healed'])
                         
                         # (Remove the old snapshot date warning logic, it's handled per-row now)
                             
