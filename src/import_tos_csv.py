@@ -2,50 +2,74 @@ import pandas as pd
 import hashlib
 import re
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
-import csv
+import csv 
 
 def generate_hash(record_dict):
     """Creates a unique hash for a row to prevent duplicates."""
     raw_str = "".join(str(val) for val in record_dict.values())
     return hashlib.md5(raw_str.encode()).hexdigest()
+
 def clean_currency(val):
     """Converts string currency ($1,000.00) or ((1,000.00)) to float."""
-    # 1. Handle direct numeric types (float/int/numpy types)
     if isinstance(val, (int, float)):
-        # CRITICAL FIX: Check for NaN (Not a Number)
         if pd.isna(val): 
             return 0.0
         return float(val)
-        
-    # 2. Handle Strings
     val = str(val).replace('$', '').replace(',', '').replace('(', '-').replace(')', '').strip()
-    
-    # Check for empty strings or 'nan' text
     if val == '' or val.lower() == 'nan':
         return 0.0
-        
     try:
         return float(val)
     except ValueError:
         return 0.0
+
 def clean_text(val):
     """Converts NaN/Empty strings to None (Database NULL)."""
     if pd.isna(val):
         return None
     val = str(val).strip()
     return val if val != '' else None
-def find_idx(df, keyword):
-    """Helper to find the row index where a specific keyword appears in column 0."""
-    matches = df[df[0].astype(str).str.startswith(keyword, na=False)]
-    return matches.index[0] if not matches.empty else None
+
+def extract_section(df_raw, start_idx, end_idx, key_col_candidates):
+    """Slices the raw dataframe and promotes the correct header row."""
+    if start_idx is None:
+        return pd.DataFrame()
+    sl = df_raw.iloc[start_idx+1 : end_idx] if end_idx else df_raw.iloc[start_idx+1 :]
+    if sl.empty:
+        return pd.DataFrame()
+
+    header_idx = -1
+    found_cols = []
+    for i in range(min(10, len(sl))):
+        row_vals = sl.iloc[i].astype(str).tolist()
+        for key in key_col_candidates:
+            if any(key in val for val in row_vals):
+                header_idx = i
+                found_cols = row_vals
+                break
+        if header_idx != -1:
+            break
+            
+    if header_idx == -1:
+        return pd.DataFrame()
+
+    data_slice = sl.iloc[header_idx+1 :].copy()
+    clean_headers = [str(c).strip() if pd.notna(c) and str(c).strip() != '' else f"UNK_{k}" for k, c in enumerate(found_cols)]
+    
+    if len(clean_headers) == len(data_slice.columns):
+        data_slice.columns = clean_headers
+    return data_slice
+
+def find_section_start(df_raw, section_name):
+    mask = df_raw[0].astype(str).str.strip().str.startswith(section_name, na=False)
+    indices = df_raw.index[mask].tolist()
+    return indices[0] if indices else None
+
 def parse_file(uploaded_file):
     """
-    Parses ThinkOrSwim CSV.
-    Returns:
-    1. transactions (List of Dicts)
-    2. snapshots_list (List of Dicts)
+    Parses ThinkOrSwim CSV using a Robust One-Pass Loader with Fuzzy Matching.
     """
     
     # --- 1. PRE-SCAN (Text Mode) ---
@@ -65,183 +89,268 @@ def parse_file(uploaded_file):
         else:
             statement_date = datetime.now().date()
 
-    # B. Find Net Liquidating Value (Robust CSV Parsing)
+    # B. Find Net Liquidating Value
     net_liq_value = 0.0
-    
-    # Use csv.reader to handle quoted numbers like "$1,234.56" correctly
-    reader = csv.reader(lines[:100]) # Scan first 100 lines
-    for row in reader:
-        # row is a list of fields, e.g. ['Net Liquidating Value', '$123,456.78']
-        if any("Net Liquidating Value" in str(cell) for cell in row):
+    reader = csv.reader(lines)
+    for i, row in enumerate(reader):
+        line_text = lines[i]
+        if "Net Liquidating Value" in line_text:
+            found_in_cells = False
             for cell in row:
                 try:
+                    if "Net Liquidating Value" in str(cell): continue
                     val = clean_currency(cell)
-                    if val > 0:
+                    if val != 0.0:
                         net_liq_value = val
+                        found_in_cells = True
                         break
                 except: continue
-            if net_liq_value > 0: 
-                break
-
-    # --- 2. LOAD RAW DATA (Pandas Mode) ---
-    uploaded_file.seek(0)
-    df_raw = pd.read_csv(uploaded_file, header=None, low_memory=False)
+            if found_in_cells: break
+            match = re.search(r"Net Liquidating Value[^\d-]*(-?\$?[\d,]+(\.\d+)?)", line_text)
+            if match:
+                try:
+                    val = clean_currency(match.group(1))
+                    if val != 0.0:
+                        net_liq_value = val
+                        break
+                except: pass
     
-    idx_eq = find_idx(df_raw, "Equities")
-    idx_opt = find_idx(df_raw, "Options")
-    idx_prof = find_idx(df_raw, "Profits and Losses")
-    idx_cash = find_idx(df_raw, "Cash Balance")
-    idx_trade = find_idx(df_raw, "Account Trade History")
+    # --- 2. LOAD RAW DATA ---
+    uploaded_file.seek(0)
+    dummy_cols = list(range(100)) 
+    df_raw = pd.read_csv(uploaded_file, header=None, names=dummy_cols, engine='python')
+    
+    # --- 3. LOCATE SECTIONS ---
+    idx_cash = find_section_start(df_raw, "Cash Balance")
+    idx_trade = find_section_start(df_raw, "Account Trade History")
+    idx_eq = find_section_start(df_raw, "Equities")
+    idx_opt = find_section_start(df_raw, "Options")
+    idx_prof = find_section_start(df_raw, "Profits and Losses")
+    idx_summary = find_section_start(df_raw, "Account Summary")
+    
+    all_indices = sorted([i for i in [idx_cash, idx_trade, idx_eq, idx_opt, idx_prof, idx_summary] if i is not None])
+    
+    def get_end_idx(start_idx):
+        if start_idx is None: return None
+        next_indices = [i for i in all_indices if i > start_idx]
+        return next_indices[0] if next_indices else None
 
-    # --- 3. PARSE POSITIONS (Held on Statement Date) ---
+    # --- 4. EXTRACT DATAFRAMES ---
+    df_cash = pd.DataFrame()
+    if idx_cash is not None:
+        df_cash = extract_section(df_raw, idx_cash, get_end_idx(idx_cash), ["DATE", "Date"])
+        # Standardize Cash Date Column immediately
+        if not df_cash.empty:
+            # Try to find the date column
+            date_col = 'DATE' if 'DATE' in df_cash.columns else ('Date' if 'Date' in df_cash.columns else None)
+            if date_col:
+                df_cash['dt_obj'] = pd.to_datetime(df_cash[date_col], errors='coerce')
+
+    df_equities = pd.DataFrame()
+    if idx_eq is not None:
+        df_equities = extract_section(df_raw, idx_eq, get_end_idx(idx_eq), ["Symbol"])
+
+    df_options = pd.DataFrame()
+    if idx_opt is not None:
+        df_options = extract_section(df_raw, idx_opt, get_end_idx(idx_opt), ["Option Code", "Symbol"])
+
+    df_history = pd.DataFrame()
+    if idx_trade is not None:
+        df_history = extract_section(df_raw, idx_trade, get_end_idx(idx_trade), ["Exec Time", "DATE", "Date"])
+
+    # --- 5. PARSE POSITIONS ---
     current_positions = []
     
-    # A. Equities
-    if idx_eq:
-        end_eq = idx_opt if idx_opt else (idx_prof if idx_prof else idx_cash)
-        if end_eq:
-            uploaded_file.seek(0)
-            df_equities = pd.read_csv(uploaded_file, skiprows=idx_eq+1, nrows=end_eq-(idx_eq+2))
-            
-            if 'Symbol' in df_equities.columns:
-                df_equities = df_equities.dropna(subset=['Symbol'])
-                for _, row in df_equities.iterrows():
-                    if row['Symbol'] == 'Total': continue
-                    
-                    current_positions.append({
-                        "symbol": clean_text(row['Symbol']),
-                        "description": clean_text(row.get('Description')),
-                        "qty": clean_currency(row.get('Qty')),
-                        "mark_price": clean_currency(row.get('Mark')),
-                        "market_value": clean_currency(row.get('Market Value')),
-                        "asset_type": "STOCK" # Requested Change
-                    })
+    if not df_equities.empty and 'Symbol' in df_equities.columns:
+        df_equities = df_equities.dropna(subset=['Symbol'])
+        for _, row in df_equities.iterrows():
+            if str(row['Symbol']) == 'Total': continue
+            current_positions.append({
+                "symbol": clean_text(row['Symbol']),
+                "description": clean_text(row.get('Description')),
+                "qty": clean_currency(row.get('Qty')),
+                "mark_price": clean_currency(row.get('Mark')),
+                "market_value": clean_currency(row.get('Market Value')),
+                "asset_type": "STOCK" 
+            })
 
-    # B. Options
-    if idx_opt:
-        end_opt = idx_prof if idx_prof else idx_cash
-        if end_opt:
-            uploaded_file.seek(0)
-            df_options = pd.read_csv(uploaded_file, skiprows=idx_opt+1, nrows=end_opt-(idx_opt+2))
-            
-            col_name = 'Option Code' if 'Option Code' in df_options.columns else 'Symbol'
-            
-            if col_name in df_options.columns:
-                df_options = df_options.dropna(subset=[col_name])
-                for _, row in df_options.iterrows():
-                    if row[col_name] == 'Total': continue
-                    
-                    current_positions.append({
-                        "symbol": clean_text(row[col_name]),
-                        "description": clean_text(row.get('Exp')),
-                        "qty": clean_currency(row.get('Qty')),
-                        "mark_price": clean_currency(row.get('Mark')),
-                        "market_value": clean_currency(row.get('Market Value')),
-                        "asset_type": "OPTION",
-                        "exp_date_str": clean_text(row.get('Exp')),
-                        "strike": clean_currency(row.get('Strike')),
-                        "option_type": clean_text(row.get('Type'))
-                    })
+    if not df_options.empty:
+        col_name = 'Option Code' if 'Option Code' in df_options.columns else 'Symbol'
+        if col_name in df_options.columns:
+            df_options = df_options.dropna(subset=[col_name])
+            for _, row in df_options.iterrows():
+                if str(row[col_name]) == 'Total': continue
+                current_positions.append({
+                    "symbol": clean_text(row[col_name]),
+                    "description": clean_text(row.get('Exp')),
+                    "qty": clean_currency(row.get('Qty')),
+                    "mark_price": clean_currency(row.get('Mark')),
+                    "market_value": clean_currency(row.get('Market Value')),
+                    "asset_type": "OPTION",
+                    "exp_date_str": clean_text(row.get('Exp')),
+                    "strike": clean_currency(row.get('Strike')),
+                    "option_type": clean_text(row.get('Type'))
+                })
 
-    # --- 4. PARSE CASH BALANCE ---
+    # --- 6. PARSE SNAPSHOTS ---
     snapshots_list = []
-    if idx_cash:
-        nrows = (idx_trade - (idx_cash + 2)) if idx_trade else None
+    if not df_cash.empty:
+        # Check for 'TYPE' or 'Type'
+        type_col = 'TYPE' if 'TYPE' in df_cash.columns else ('Type' if 'Type' in df_cash.columns else None)
+        bal_col = 'BALANCE' if 'BALANCE' in df_cash.columns else ('Balance' if 'Balance' in df_cash.columns else None)
         
-        uploaded_file.seek(0)
-        df_cash = pd.read_csv(uploaded_file, skiprows=idx_cash+1, nrows=nrows)
-        
-        if 'TYPE' in df_cash.columns:
-            df_bals = df_cash[df_cash['TYPE'] == 'BAL']
-            
+        if type_col and bal_col:
+            df_bals = df_cash[df_cash[type_col] == 'BAL']
             for _, row in df_bals.iterrows():
                 try:
-                    snap_date = pd.to_datetime(row['DATE']).date()
-                except:
-                    continue
+                    snap_date = pd.to_datetime(row.get('DATE', row.get('Date'))).date()
+                except: continue
                 
                 is_valid_liq = (snap_date == statement_date)
                 
                 snapshots_list.append({
                     "snapshot_date": snap_date,
-                    "total_cash_balance": clean_currency(row.get('BALANCE', 0)),
+                    "total_cash_balance": clean_currency(row.get(bal_col, 0)),
                     "net_liquidating_value": net_liq_value if is_valid_liq else None,
                     "is_net_liq_valid": is_valid_liq,
                     "positions": current_positions if is_valid_liq else []
                 })
 
-    # --- 5. PARSE TRANSACTIONS ---
+    # --- 7. PARSE TRANSACTIONS (Fuzzy Settlement Match) ---
     transactions = []
-    if idx_trade:
-        uploaded_file.seek(0)
-        df_history = pd.read_csv(uploaded_file, skiprows=idx_trade+1)
+    
+    # Init Match Tracker
+    if not df_cash.empty:
+        # Standardize Amount column
+        amt_col = 'AMOUNT' if 'AMOUNT' in df_cash.columns else ('Amount' if 'Amount' in df_cash.columns else None)
+        desc_col = 'DESCRIPTION' if 'DESCRIPTION' in df_cash.columns else ('Description' if 'Description' in df_cash.columns else None)
         
-        df_history.replace(r'^\s*$', np.nan, regex=True, inplace=True)
-        columns_to_fill = ['Exec Time', 'Spread']
-        existing_cols = [c for c in columns_to_fill if c in df_history.columns]
-        df_history[existing_cols] = df_history[existing_cols].ffill()
-        df_history.dropna(subset=['Exec Time'], inplace=True)
-
-        for index, trade in df_history.iterrows():
-            # Date/Time Logic
-            raw_datetime = str(trade.get('Exec Time', ''))
-            trade_date_str = None
-            trade_time_str = "00:00:00"
-
-            if ' ' in raw_datetime:
-                parts = raw_datetime.split(' ')
-                trade_date_str = parts[0]
-                trade_time_str = parts[1]
-                if len(trade_time_str.split(':')) == 2:
-                    trade_time_str += ":00"
-
-            trade_symbol = clean_text(trade.get('Symbol'))
-
-            # Fee Matching
-            fees = 0.0
-            commissions = 0.0
-            cash_desc = None
+        if amt_col:
+            df_cash['clean_amount'] = df_cash[amt_col].apply(clean_currency)
+        else:
+            df_cash['clean_amount'] = 0.0
             
-            if 'df_cash' in locals():
-                safe_symbol = re.escape(str(trade_symbol)) if trade_symbol else ""
-                if safe_symbol:
-                    matches = df_cash[
-                        (df_cash['DATE'] == trade_date_str) & 
-                        (df_cash['DESCRIPTION'].str.contains(rf'\b{safe_symbol}\b', regex=True, na=False))
+        df_cash['is_matched'] = False
+        df_cash['match_id'] = df_cash.index
+
+    if not df_history.empty:
+        # 1. Fill Down Logic
+        #for c in ['Exec Time', 'Spread']:
+        for c in ['Exec Time', 'Spread', 'Symbol', 'Exp']:
+            if c in df_history.columns:
+                df_history[c] = df_history[c].replace(r'^\s*$', np.nan, regex=True).ffill()
+        
+        if 'Exec Time' in df_history.columns:
+            df_history.dropna(subset=['Exec Time'], inplace=True)
+            
+            for index, trade in df_history.iterrows():
+                # Date/Time Logic
+                raw_datetime = str(trade.get('Exec Time', ''))
+                trade_date_str = None
+                trade_time_str = "00:00:00"
+                trade_dt_obj = None
+
+                if ' ' in raw_datetime:
+                    parts = raw_datetime.split(' ')
+                    trade_date_str = parts[0]
+                    trade_time_str = parts[1]
+                    if len(trade_time_str.split(':')) == 2:
+                        trade_time_str += ":00"
+                    
+                    try:
+                        trade_dt_obj = pd.to_datetime(trade_date_str)
+                    except: pass
+
+                trade_symbol = clean_text(trade.get('Symbol'))
+                
+                # Basic Amounts
+                qty_val = clean_currency(trade.get('Qty'))
+                price_val = clean_currency(trade.get('Price'))
+                
+                # Check for Option
+                # CASE INSENSITIVE CHECK for Exp/Spread
+                # We try to get 'Exp' or 'EXP' or 'exp'
+                exp_val = clean_text(trade.get('Exp') or trade.get('EXP') or trade.get('exp'))
+                spread_val = clean_text(trade.get('Spread') or trade.get('SPREAD'))
+                
+                is_option = (exp_val is not None) or (spread_val is not None and spread_val != 'STOCK')
+                multiplier = 100 if is_option else 1
+                
+                gross_trade_amount = -(qty_val * price_val * multiplier)
+
+                # Fee Matching (FUZZY LOGIC)
+                fees = 0.0
+                commissions = 0.0
+                cash_desc = None
+                
+                # We need trade_dt_obj to do math
+                if not df_cash.empty and trade_symbol and trade_dt_obj and desc_col:
+                    safe_symbol = re.escape(str(trade_symbol))
+                    
+                    # FUZZY MATCH: Look for Cash Entry between [TradeDate] and [TradeDate + 4 Days]
+                    # This handles weekends and T+1/T+2 settlement
+                    start_date = trade_dt_obj
+                    end_date = trade_dt_obj + timedelta(days=4)
+                    
+                    candidates = df_cash[
+                        (df_cash['dt_obj'] >= start_date) & 
+                        (df_cash['dt_obj'] <= end_date) &
+                        (~df_cash['is_matched']) &
+                        (df_cash[desc_col].astype(str).str.contains(rf'\b{safe_symbol}\b', regex=True, na=False))
                     ]
-                    if not matches.empty:
-                        fees = matches['Misc Fees'].apply(clean_currency).sum()
-                        commissions = matches['Commissions & Fees'].apply(clean_currency).sum()
-                        cash_desc = clean_text(matches.iloc[0].get('DESCRIPTION'))
+                    
+                    best_match_idx = None
+                    
+                    if not candidates.empty:
+                        # Strict Filter: Amount proximity ($20 buffer)
+                        candidates = candidates.copy()
+                        candidates['diff'] = (candidates['clean_amount'] - gross_trade_amount).abs()
+                        candidates = candidates.sort_values('diff')
+                        
+                        if candidates.iloc[0]['diff'] < 20.0:
+                            best_match_idx = candidates.iloc[0]['match_id']
+                        elif len(candidates) == 1:
+                            best_match_idx = candidates.iloc[0]['match_id']
 
-            # Calculation
-            raw_exp = str(trade.get('Exp', '')).strip()
-            is_option = (raw_exp != '' and raw_exp.lower() != 'nan') or (pd.notna(trade.get('Spread')) and trade.get('Spread') != 'STOCK')
-            multiplier = 100 if is_option else 1
-            
-            qty_val = clean_currency(trade.get('Qty'))
-            price_val = clean_currency(trade.get('Price'))
-            calculated_net = -(qty_val * price_val * multiplier) - fees - commissions
+                    # Consume the Match
+                    if best_match_idx is not None:
+                        match_row = df_cash.loc[best_match_idx]
+                        
+                        # Handle potential column name variations
+                        misc_col = 'Misc Fees' if 'Misc Fees' in df_cash.columns else 'MISC FEES'
+                        comm_col = 'Commissions & Fees' if 'Commissions & Fees' in df_cash.columns else 'COMMISSIONS & FEES'
+                        
+                        fees = clean_currency(match_row.get(misc_col, 0))
+                        commissions = clean_currency(match_row.get(comm_col, 0))
+                        cash_desc = clean_text(match_row.get(desc_col))
+                        
+                        df_cash.loc[best_match_idx, 'is_matched'] = True
 
-            record = {
-                "Exec_Date": trade_date_str,
-                "Exec_Time": trade_time_str,
-                "Symbol": trade_symbol,
-                "Qty": qty_val,
-                "Price": price_val,
-                "Side": clean_text(trade.get('Side')),
-                "spread": clean_text(trade.get('Spread')),
-                "pos_effect": clean_text(trade.get('Pos Effect')),
-                "exp_date_str": clean_text(trade.get('Exp')),
-                "strike": clean_currency(trade.get('Strike')),
-                "option_type": clean_text(trade.get('Type')),
-                "cb_description": cash_desc,
-                "cb_misc_fees": fees,
-                "cb_commissions": commissions,
-                "cb_amount": calculated_net,
-                "transaction_type": "TRADE"
-            }
-            record['row_hash'] = generate_hash(record)
-            transactions.append(record)
+                calculated_net = gross_trade_amount + fees + commissions
+
+                # Safely get Strike/Option Type with fallback keys
+                strike_val = clean_currency(trade.get('Strike') or trade.get('STRIKE'))
+                type_val = clean_text(trade.get('Type') or trade.get('TYPE'))
+
+                record = {
+                    "Exec_Date": trade_date_str,
+                    "Exec_Time": trade_time_str,
+                    "Symbol": trade_symbol,
+                    "Qty": qty_val,
+                    "Price": price_val,
+                    "Side": clean_text(trade.get('Side')),
+                    "spread": spread_val,
+                    "pos_effect": clean_text(trade.get('Pos Effect')),
+                    "exp_date_str": exp_val,
+                    "strike": strike_val,
+                    "option_type": type_val,
+                    "cb_description": cash_desc,
+                    "cb_misc_fees": fees,
+                    "cb_commissions": commissions,
+                    "cb_amount": calculated_net,
+                    "transaction_type": "TRADE"
+                }
+                record['row_hash'] = generate_hash(record)
+                transactions.append(record)
 
     return transactions, snapshots_list

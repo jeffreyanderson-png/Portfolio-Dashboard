@@ -19,7 +19,7 @@ from models import Transaction, AccountSnapshot
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="Pilot Portfolio Manager v2.0",
+    page_title="Pilot Portfolio Manager v2.1",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -48,7 +48,7 @@ def init_db():
 
 # --- MAIN APP LOGIC ---
 def main():
-    st.title("✈️ Pilot Portfolio Manager v2.0")
+    st.title("✈️ Pilot Portfolio Manager v2.1")
     # Ensure DB tables exist before we do anything else
     init_db()
     

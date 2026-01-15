@@ -74,24 +74,69 @@ def save_import_data(engine, transactions_list: list, snapshots_list: list):
 
         # --- 2. TRANSACTIONS ---
         for row in transactions_list:
-            try:
-                exec_date_obj = pd.to_datetime(row['Exec_Date'], format='%m/%d/%Y').date()
-            except:
-                exec_date_obj = pd.to_datetime(row['Exec_Date']).date()
+            
+            # --- FIX: SAFE DATE CONVERSION ---
+            exec_date_obj = None
+            raw_date = row.get('Exec_Date')
+            
+            if raw_date:
+                try:
+                    # Try explicit format first
+                    dt = pd.to_datetime(raw_date, format='%m/%d/%Y')
+                    if pd.notna(dt):
+                        exec_date_obj = dt.date()
+                except:
+                    # Fallback to smart parsing
+                    try:
+                        dt = pd.to_datetime(raw_date)
+                        if pd.notna(dt):
+                            exec_date_obj = dt.date()
+                    except:
+                        exec_date_obj = None
 
-            try:
-                exec_time_obj = pd.to_datetime(str(row['Exec_Time'])).time()
-            except:
-                exec_time_obj = None
+            # Check if trade exists
+            existing_trade = session.exec(
+                select(Transaction).where(Transaction.row_hash == transaction.row_hash)
+            ).first()
+
+            if existing_trade:
+                # SELF-HEALING LOGIC:
+                # If the DB has no description, but the new import FOUND one, update it!
+                if not existing_trade.cb_description and transaction.cb_description:
+                    existing_trade.cb_description = transaction.cb_description
+                    existing_trade.cb_misc_fees = transaction.cb_misc_fees
+                    existing_trade.cb_commissions = transaction.cb_commissions
+                    existing_trade.cb_amount = transaction.cb_amount
+                    
+                    session.add(existing_trade)
+                    session.commit()
+                    # We can count this as 'healed' or just ignore stats
                 
-            # DATE FIX here too
+                stats['trades_skipped'] += 1 # Technically we skipped inserting a NEW one
+            else:
+                session.add(transaction)
+                session.commit()
+                stats['trades_added'] += 1
+                
+            # --- FIX: SAFE TIME CONVERSION ---
+            exec_time_obj = None
+            if row.get('Exec_Time'):
+                try:
+                    dt = pd.to_datetime(str(row['Exec_Time']))
+                    if pd.notna(dt):
+                        exec_time_obj = dt.time()
+                except:
+                    exec_time_obj = None
+                
+            # Expiration (Already Safe, but kept for context)
             exp_date_obj = None
             if row.get('exp_date_str'):
                 try:
                     dt = pd.to_datetime(row['exp_date_str'], format='%d-%b-%y')
                     if pd.notna(dt):
                         exp_date_obj = dt.date()
-                except: pass
+                except: 
+                    pass
 
             transaction = Transaction(
                 exec_date=exec_date_obj,
