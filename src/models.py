@@ -1,92 +1,117 @@
 from typing import Optional, List
 from sqlmodel import SQLModel, Field, Relationship
-from datetime import date, time
+from datetime import date, time, datetime
 
+# --- 1. CONFIGURATION TABLES ---
+class Strategy(SQLModel, table=True):
+    """Defines the high-level strategy types (e.g., 'The Wheel', 'Calendar Spread')"""
+    __table_args__ = {"extend_existing": True}
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(unique=True, index=True) 
+    description: Optional[str] = None
+    
+    # Back-populates
+    campaigns: List["Campaign"] = Relationship(back_populates="strategy")
+    symbol_defaults: List["SymbolSettings"] = Relationship(back_populates="default_strategy")
+
+class SymbolSettings(SQLModel, table=True):
+    """Stores user defaults for specific symbols"""
+    __table_args__ = {"extend_existing": True}
+    symbol: str = Field(primary_key=True) # "GOOG", "ASTS"
+    
+    # Default Strategy for this symbol
+    default_strategy_id: Optional[int] = Field(default=None, foreign_key="strategy.id")
+    default_strategy: Optional[Strategy] = Relationship(back_populates="symbol_defaults")
+    
+    notes: Optional[str] = None # General notes on the ticker
+
+# --- 2. CAMPAIGN MANAGEMENT ---
+class Campaign(SQLModel, table=True):
+    """A specific instance of a strategy (e.g., 'GOOG Wheel Jan 2026')"""
+    __table_args__ = {"extend_existing": True}
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str 
+    symbol: str # The primary ticker this campaign focuses on
+    start_date: date = Field(default_factory=date.today)
+    status: str = Field(default="OPEN") # OPEN, CLOSED, ARCHIVED
+    
+    # Link to the Strategy Definition
+    strategy_id: Optional[int] = Field(default=None, foreign_key="strategy.id")
+    strategy: Optional[Strategy] = Relationship(back_populates="campaigns")
+    
+    # Data Links
+    notes: List["Note"] = Relationship(back_populates="campaign")
+    transactions: List["Transaction"] = Relationship(back_populates="campaign")
+
+class Note(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
+    id: Optional[int] = Field(default=None, primary_key=True)
+    created_at: datetime = Field(default_factory=datetime.now)
+    content: str
+    
+    campaign_id: Optional[int] = Field(default=None, foreign_key="campaign.id")
+    campaign: Optional[Campaign] = Relationship(back_populates="notes")
+
+# --- 3. CORE DATA ---
 class Transaction(SQLModel, table=True):
-    # --- ADD THIS LINE to update the definition if this table is already defined, don't crash.
     __table_args__ = {"extend_existing": True}
     
-    # --- Primary Key ---
-    # We need a unique ID for our database, even if ToS doesn't provide one.
     id: Optional[int] = Field(default=None, primary_key=True)
-
-    # --- Account Trade History Data ---
-    exec_date: Optional[date] = None    # Converted from String during import
-    exec_time: Optional[time] = None    # Converted from String during import
-    symbol: str                         # The Ticker (e.g., "AMD", "GOOG")
+    exec_date: Optional[date] = None
+    exec_time: Optional[time] = None
+    symbol: str
     qty: float
-    price: float                        # Price per Share/Contract 
-    side: str                           # "BUY", "SELL"
-    spread: Optional[str] = None        # Was: spread: str; e.g. data "VERTICAL", "SINGLE", "STOCK"
-    pos_effect: Optional[str] = None    # Was: pos_effect: str; e.g. # "TO OPEN", "TO CLOSE"
+    price: float
+    side: str
+    spread: Optional[str] = None
+    pos_effect: Optional[str] = None
     
-    # Options Data (These will be Null/None for stock trades)
     exp_date: Optional[date] = None
     strike: Optional[float] = None
-    option_type: Optional[str] = None   # "CALL", "PUT"
+    option_type: Optional[str] = None
     
-    # --- Cash Balance Data ---
-    # We use default=0.0 so we don't break if data is missing
     cb_misc_fees: float = Field(default=0.0)
     cb_commissions: float = Field(default=0.0)
-    cb_amount: float = Field(default=0.0) # The Net Total of the transaction minus fees
+    cb_amount: float = Field(default=0.0)
     cb_description: Optional[str] = None
-
-    # In src/models.py inside class Transaction:
-    transaction_type: str = Field(default="TRADE") # e.g., "TRADE", "ASSIGNMENT"
     
-    # --- Deduplication ---
-    # We enforce uniqueness here. If we try to save a row with the same hash, 
-    # the database will reject it (or we can handle it in code).
+    transaction_type: str = Field(default="TRADE")
     row_hash: str = Field(unique=True, index=True)
-
-    # --- Metadata ---
-    # Good practice to track when you actually imported this row
     imported_at: date = Field(default_factory=date.today)
-
-    # --- VALIDATION FIELDS ---
+    
     manual_review: bool = Field(default=False)
     review_reason: Optional[str] = None
- 
+    
+    # NEW: Link to Campaign (The "Bucket")
+    campaign_id: Optional[int] = Field(default=None, foreign_key="campaign.id")
+    campaign: Optional[Campaign] = Relationship(back_populates="transactions")
+
 class AccountSnapshot(SQLModel, table=True):
-    # --- ADD THIS LINE to update the definition if this table is already defined, don't crash.
     __table_args__ = {"extend_existing": True}
-    
     id: Optional[int] = Field(default=None, primary_key=True)
-
-    # This date comes from the "Cash Balance" row (e.g., 1/13/26)
     snapshot_date: date = Field(index=True)
-    
-    # Cash is known every day (from 'BAL' rows)
-    total_cash_balance: float = Field(default=0.0)
-    
-    # Net Liq is ONLY known on the statement generation date
+    total_cash_balance: float = Field(default=0.0) 
     net_liquidating_value: Optional[float] = None 
-    is_net_liq_valid: bool = Field(default=False) # True only if this matches File Date
-
-    # Deduplication Hash
+    is_net_liq_valid: bool = Field(default=False) 
     row_hash: str = Field(unique=True, index=True)
-    
-    # Relationship to Positions
     positions: List["PositionSnapshot"] = Relationship(back_populates="snapshot")
-    
+
 class PositionSnapshot(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
-    
     id: Optional[int] = Field(default=None, primary_key=True)
-    
-    # Link to the AccountSnapshot (Parent)
     snapshot_id: Optional[int] = Field(default=None, foreign_key="accountsnapshot.id")
     snapshot: Optional[AccountSnapshot] = Relationship(back_populates="positions")
-
+    
     symbol: str
     description: Optional[str] = None
     qty: float
     mark_price: float
     market_value: float
-    asset_type: str # "STOCK", "OPTION", "FUTURE", "ETF", etc.
-    
-    # Option Specifics
+    asset_type: str
     exp_date: Optional[date] = None
     strike: Optional[float] = None
-    option_type: Optional[str] = None # Call/Put
+    option_type: Optional[str] = None
+    
+    # Cached Strategy Name (Optional, for quick filtering on the dashboard without joining)
+    # Alternatively, we could link Position -> Campaign, but positions are ephemeral snapshots.
+    # For now, let's keep it simple.

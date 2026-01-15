@@ -1,7 +1,7 @@
 from sqlmodel import Session, select, create_engine
 from sqlalchemy.exc import IntegrityError
 import pandas as pd
-from models import Transaction, AccountSnapshot, PositionSnapshot
+from src.models import Transaction, AccountSnapshot, PositionSnapshot, Campaign, Note, Strategy
 
 def create_engine_func(db_url):
     return create_engine(db_url)

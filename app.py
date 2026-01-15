@@ -16,6 +16,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 import dbfunctions
 import import_tos_csv
 from models import Transaction, AccountSnapshot
+from src import seed_data
 
 # --- CONFIGURATION ---
 st.set_page_config(
@@ -30,6 +31,10 @@ DB_FILE = "portfolio.db"
 DB_PATH = os.path.join(DB_FOLDER, DB_FILE)
 # SQLModel needs a URL format for the engine (sqlite:///path/to/db)
 DB_URL = f"sqlite:///{DB_PATH}"
+
+# AUTO-SEED HOOK
+# This runs once on startup to ensure strategies exist
+seed_data.seed_strategies()
 
 # --- INITIALIZATION ---
 def init_db():
