@@ -1,0 +1,7 @@
+streamlit
+pandas
+sqlmodel
+plotly
+openpyxl 
+# openpyxl is needed if you ever export to Excel, 
+# but also sometimes used by pandas for complex reads.
