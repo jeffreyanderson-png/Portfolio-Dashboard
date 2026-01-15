@@ -15,8 +15,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 # We import these AFTER adding 'src' to the path
 import dbfunctions
 import import_tos_csv
-from models import Transaction, AccountSnapshot
+from src.models import Transaction, AccountSnapshot
+from src import dbfunctions
 from src import seed_data
+from src.dbfunctions import create_engine_func # Ensure you have this import
 
 # --- CONFIGURATION ---
 st.set_page_config(
@@ -32,23 +34,21 @@ DB_PATH = os.path.join(DB_FOLDER, DB_FILE)
 # SQLModel needs a URL format for the engine (sqlite:///path/to/db)
 DB_URL = f"sqlite:///{DB_PATH}"
 
-# AUTO-SEED HOOK
-# This runs once on startup to ensure strategies exist
-seed_data.seed_strategies()
-
 # --- INITIALIZATION ---
 def init_db():
     """Checks if DB exists, creates folder if needed."""
     if not os.path.exists(DB_FOLDER):
         os.makedirs(DB_FOLDER)
     
-    # Create the engine here (we will move this to dbfunctions later, 
-    # but good to see it working here first)
-    engine = create_engine(DB_URL)
-    
-    # This creates the tables if they don't exist yet
+    # --- INITIALIZATION ---
+    engine = create_engine_func(DB_URL)
+
+    # 1. Create Tables (Idempotent - won't break if they exist)
     SQLModel.metadata.create_all(engine)
-    
+
+    # 2. Seed Data (Now safe to run because tables exist)
+    seed_data.seed_strategies(DB_URL)
+
     return engine
 
 # --- MAIN APP LOGIC ---
