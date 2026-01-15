@@ -1,116 +1,124 @@
 from sqlmodel import Session, select, create_engine
 from sqlalchemy.exc import IntegrityError
-from datetime import datetime
 import pandas as pd
-# FIX: Removed the '.' before models
-from models import Transaction, AccountSnapshot
+from models import Transaction, AccountSnapshot, PositionSnapshot
 
-def save_import_data(engine, df_transactions: pd.DataFrame, snapshot_dict: dict): # Main function to save parsed data to the DB.
-    # Returns a status dictionary with counts of added/skipped records.
-    
+def save_import_data(engine, transactions_list: list, snapshots_list: list):
     stats = {
-        "trades_added": 0,
-        "trades_skipped": 0,
-        "snapshot_added": False
+        "trades_added": 0, "trades_skipped": 0,
+        "snapshots_processed": 0, "positions_added": 0
     }
 
     with Session(engine) as session:
-        # --- 1. SAVE SNAPSHOT ---
-        # Check if we already have a snapshot for this date
-        # We also use pd.to_datetime here just to be safe
-        snap_date = pd.to_datetime(snapshot_dict['snapshot_date']).date()
-        
-        existing_snap = session.exec(
-            select(AccountSnapshot).where(AccountSnapshot.snapshot_date == snap_date)
-        ).first()
-
-        if not existing_snap:
-            # Create new snapshot
-            new_snap = AccountSnapshot(
-                snapshot_date=snap_date,
-                net_liquidating_value=snapshot_dict['net_liquidating_value'],
-                total_cash_balance=snapshot_dict['total_cash_balance'],
-                # Generate a simple hash for the snapshot to enforce uniqueness if needed
-                row_hash=f"{snap_date}_{snapshot_dict['net_liquidating_value']}"
-            )
-            session.add(new_snap)
-            stats['snapshot_added'] = True
-        
-        # --- 2. SAVE TRANSACTIONS ---
-        # Iterate through the DataFrame rows
-        for _, row in df_transactions.iterrows():
+        # --- 1. SNAPSHOTS ---
+        for snap_data in snapshots_list:
+            snap_date = snap_data['snapshot_date']
             
-            # --- FIX 1: EXECUTION DATE (MM/DD/YYYY) ---
-            # We explicitly look for 4-digit year (%Y)
+            existing_snap = session.exec(
+                select(AccountSnapshot).where(AccountSnapshot.snapshot_date == snap_date)
+            ).first()
+            current_snap = existing_snap
+            
+            if not existing_snap:
+                new_snap = AccountSnapshot(
+                    snapshot_date=snap_date,
+                    total_cash_balance=snap_data['total_cash_balance'],
+                    net_liquidating_value=snap_data['net_liquidating_value'],
+                    is_net_liq_valid=snap_data['is_net_liq_valid'],
+                    row_hash=f"{snap_date}_{snap_data['total_cash_balance']}"
+                )
+                session.add(new_snap)
+                session.commit()
+                session.refresh(new_snap)
+                current_snap = new_snap
+                stats['snapshots_processed'] += 1
+            else:
+                if snap_data['is_net_liq_valid'] and not current_snap.is_net_liq_valid:
+                    current_snap.net_liquidating_value = snap_data['net_liquidating_value']
+                    current_snap.is_net_liq_valid = True
+                    session.add(current_snap)
+                    session.commit()
+
+            if snap_data['positions']:
+                existing_positions = session.exec(
+                    select(PositionSnapshot).where(PositionSnapshot.snapshot_id == current_snap.id)
+                ).all()
+                for p in existing_positions:
+                    session.delete(p)
+                
+                for pos in snap_data['positions']:
+                    # DATE FIX: Check for NaT (Not a Time)
+                    exp_date_obj = None
+                    if pos.get('exp_date_str'):
+                        try:
+                            dt = pd.to_datetime(pos['exp_date_str'], format='%d-%b-%y')
+                            if pd.notna(dt): # <--- This prevents the error
+                                exp_date_obj = dt.date()
+                        except: pass
+
+                    new_pos = PositionSnapshot(
+                        snapshot_id=current_snap.id,
+                        symbol=pos['symbol'],
+                        description=pos['description'],
+                        qty=pos['qty'],
+                        mark_price=pos['mark_price'],
+                        market_value=pos['market_value'],
+                        asset_type=pos['asset_type'],
+                        exp_date=exp_date_obj,
+                        strike=pos.get('strike'),
+                        option_type=pos.get('option_type')
+                    )
+                    session.add(new_pos)
+                    stats['positions_added'] += 1
+                session.commit()
+
+        # --- 2. TRANSACTIONS ---
+        for row in transactions_list:
             try:
                 exec_date_obj = pd.to_datetime(row['Exec_Date'], format='%m/%d/%Y').date()
             except:
-                # Fallback if format is weird, but try to keep it simple
                 exec_date_obj = pd.to_datetime(row['Exec_Date']).date()
 
-            # --- FIX 2: TIME ---
-            # We treat it as a string first to strip the .000000 visual noise if needed
             try:
                 exec_time_obj = pd.to_datetime(str(row['Exec_Time'])).time()
             except:
                 exec_time_obj = None
-
-            # --- FIX 3: EXPIRATION DATE (DD-Mon-YY) ---
-            # ToS format: "16-Jan-26"
+                
+            # DATE FIX here too
             exp_date_obj = None
-            raw_exp = str(row.get('exp_date_str', ''))
-            if raw_exp.strip() != '' and raw_exp.lower() != 'nan':
+            if row.get('exp_date_str'):
                 try:
-                    # %b = Abbreviated Month (Jan), %y = 2-digit Year (26)
-                    exp_date_obj = pd.to_datetime(raw_exp, format='%d-%b-%y').date()
-                except:
-                    # Fallback for weird ones
-                    exp_date_obj = None
+                    dt = pd.to_datetime(row['exp_date_str'], format='%d-%b-%y')
+                    if pd.notna(dt):
+                        exp_date_obj = dt.date()
+                except: pass
 
-            # Map DataFrame columns to Model fields
-            # We use .get() to handle cases where a column might be missing safely
             transaction = Transaction(
-                exec_date=exec_date_obj,  # Uses the %Y parser
+                exec_date=exec_date_obj,
                 exec_time=exec_time_obj,
                 symbol=row['Symbol'],
                 qty=row['Qty'],
                 price=row['Price'],
                 side=row['Side'],
-                spread=row.get('spread'),     
+                spread=row.get('spread'),
                 pos_effect=row.get('pos_effect'),
-                
-                # Option Fields
-                exp_date=exp_date_obj,    # Uses the %y parser
+                exp_date=exp_date_obj,
                 strike=row.get('strike'),
-                option_type=row.get('option_type'), # Call/Put
-                
-                # Cash Fields
+                option_type=row.get('option_type'),
                 cb_misc_fees=row.get('cb_misc_fees', 0.0),
                 cb_commissions=row.get('cb_commissions', 0.0),
                 cb_amount=row.get('cb_amount', 0.0),
-                cb_description=row.get('cb_description'), 
-                
+                cb_description=row.get('cb_description'),
                 row_hash=row['row_hash'],
-                # Handling the "Type" we added in the parser
-                transaction_type=row.get('transaction_type', 'TRADE') 
+                transaction_type=row.get('transaction_type', 'TRADE')
             )
-            
+
             try:
                 session.add(transaction)
-                session.commit() # Try to commit this single row
+                session.commit()
                 stats['trades_added'] += 1
-            except IntegrityError as e:
-                # --- NEW DEBUGGING LINES ---
-                # This will print the specific reason to your VS Code Terminal
-                print(f"⚠️ REJECTED ROW: {row['Symbol']} on {row['Exec_Date']}")
-                print(f"   Reason: {e}") 
-                # ---------------------------
-
-                # This error means the row_hash already exists.
-                session.rollback() # Cancel the failed insert
+            except IntegrityError:
+                session.rollback()
                 stats['trades_skipped'] += 1
                 
-        # Final commit for the snapshot (if any)
-        session.commit()
-
     return stats

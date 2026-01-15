@@ -1,10 +1,10 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+#from datetime import datetime
 import os
-import hashlib
-import time
-import re
+#import hashlib
+#import time
+#import re
 from sqlmodel import SQLModel, create_engine, Session
 
 # --- SETUP: Make sure we can find the 'src' folder ---
@@ -15,7 +15,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 # We import these AFTER adding 'src' to the path
 import dbfunctions
 import import_tos_csv
-from models import Transaction, AccountSnapshot # <--- IMPORT THIS!
+from models import Transaction, AccountSnapshot
 
 # --- CONFIGURATION ---
 st.set_page_config(
@@ -78,38 +78,31 @@ def main():
                         uploaded_file.seek(0)
                         
                         # A. Parse the file
-                        df_transactions, snapshot_data = import_tos_csv.parse_file(uploaded_file)
+                        # Note: Now returns two LISTS
+                        transactions_list, snapshots_list = import_tos_csv.parse_file(uploaded_file)
                         
-                        # Fix missing snapshot date if parser didn't find one
-                        if 'snapshot_date' not in snapshot_data or not snapshot_data['snapshot_date']:
-                            if not df_transactions.empty:
-                                max_date_str = df_transactions['Exec_Date'].max()
-                                snapshot_data['snapshot_date'] = pd.to_datetime(max_date_str).date()
-                            else:
-                                snapshot_data['snapshot_date'] = datetime.now().date()
-                        
+                        # Convert transactions to DataFrame for display/metrics
+                        df_transactions = pd.DataFrame(transactions_list)
+
                         # B. Save to Database
-                        # Initialize engine only when needed
                         engine = dbfunctions.create_engine(DB_URL) 
                         
-                        # Call your save function
-                        stats = dbfunctions.save_import_data(engine, df_transactions, snapshot_data)
+                        # Pass the lists directly to the new dbfunctions logic
+                        stats = dbfunctions.save_import_data(engine, transactions_list, snapshots_list)
                         
                         # C. Show Results
                         st.success("Import Complete!")
                         
                         col1, col2, col3 = st.columns(3)
                         col1.metric("Trades Added", stats['trades_added'])
-                        col2.metric("Duplicates Skipped", stats['trades_skipped'])
-                        col3.metric("Snapshot Date", str(snapshot_data['snapshot_date']))
+                        col2.metric("Snapshots Processed", stats['snapshots_processed'])
+                        col3.metric("Positions Added", stats['positions_added'])
                         
-                        if stats['snapshot_added']:
-                            st.info("✅ New Account Snapshot created.")
-                        else:
-                            st.warning("⚠️ Snapshot for this date already existed (Skipped).")
+                        # (Remove the old snapshot date warning logic, it's handled per-row now)
                             
                         with st.expander("View Imported Data"):
-                            st.dataframe(df_transactions)
+                            if not df_transactions.empty:
+                                st.dataframe(df_transactions)
 
                     except Exception as e:
                         # Print the full error to the UI so we can see it

@@ -1,272 +1,247 @@
-import numpy as np # Make sure to import numpy at the top
 import pandas as pd
 import hashlib
+import re
+import numpy as np
+from datetime import datetime
 import io
-import re  # Added for Regex parsing
+import csv
 
-def generate_hash(row): #Creates a unique fingerprint for a transaction row.
-    #Combines core fields: Date + Time + Symbol + Side + Qty + Price
-    # We concatenate values into a single string. 
-    # Example: "2026-01-1310:30:00AMDTOCLOSE-15.50"
-    raw_str = f"{row['Exec_Date']}{row['Exec_Time']}{row['Symbol']}{row['Side']}{row['Qty']}{row['Price']}"
-    
-    # Return the MD5 hash of that string
+def generate_hash(record_dict):
+    """Creates a unique hash for a row to prevent duplicates."""
+    raw_str = "".join(str(val) for val in record_dict.values())
     return hashlib.md5(raw_str.encode()).hexdigest()
-
-def clean_currency(value): #Converts strings like '$1,200.50' or '(5.00)' to floats.
+def clean_currency(val):
+    """Converts string currency ($1,000.00) or ((1,000.00)) to float."""
+    # 1. Handle direct numeric types (float/int/numpy types)
+    if isinstance(val, (int, float)):
+        # CRITICAL FIX: Check for NaN (Not a Number)
+        if pd.isna(val): 
+            return 0.0
+        return float(val)
+        
+    # 2. Handle Strings
+    val = str(val).replace('$', '').replace(',', '').replace('(', '-').replace(')', '').strip()
     
-    if pd.isna(value) or value == '':
+    # Check for empty strings or 'nan' text
+    if val == '' or val.lower() == 'nan':
         return 0.0
-    
-    str_val = str(value).replace('$', '').replace(',', '')
-    
-    # Handle parentheses for negative numbers: (5.00) -> -5.00
-    if '(' in str_val and ')' in str_val:
-        str_val = '-' + str_val.replace('(', '').replace(')', '')
         
     try:
-        return float(str_val)
+        return float(val)
     except ValueError:
         return 0.0
-
-def parse_file(file_object):
-    content = file_object.getvalue().decode("utf-8")
-    lines = content.splitlines()
-
-    # --- 1. SECTION FINDER (Updated for "Futures Statements") ---
-    sections = {}
-    for i, line in enumerate(lines):
-        clean_line = line.strip()
-        if clean_line.startswith("Account Trade History"):
-            sections['history_start'] = i + 1
-        elif clean_line.startswith("Equities"):
-            sections['history_end'] = i
-        elif clean_line.startswith("Cash Balance"):
-            sections['cash_start'] = i + 1
-        elif clean_line.startswith("Futures Statements"): # Updated per your request
-            sections['cash_end'] = i
-        elif clean_line.startswith("Account Summary"):
-            sections['summary_start'] = i + 1
-            
-    # --- UPDATED: 2. EXTRACT SNAPSHOT DATA ---
-    net_liq = 0.0
-    summary_end = sections.get('summary_start', len(lines)) + 20
-    summary_lines = lines[sections['summary_start']:summary_end]
+def clean_text(val):
+    """Converts NaN/Empty strings to None (Database NULL)."""
+    if pd.isna(val):
+        return None
+    val = str(val).strip()
+    return val if val != '' else None
+def find_idx(df, keyword):
+    """Helper to find the row index where a specific keyword appears in column 0."""
+    matches = df[df[0].astype(str).str.startswith(keyword, na=False)]
+    return matches.index[0] if not matches.empty else None
+def parse_file(uploaded_file):
+    """
+    Parses ThinkOrSwim CSV.
+    Returns:
+    1. transactions (List of Dicts)
+    2. snapshots_list (List of Dicts)
+    """
     
-    for line in summary_lines:
-        if "Net Liquidating Value" in line:
-            # Strategy: Split by comma, look for the first valid number
-            parts = line.split(',')
-            for part in parts:
+    # --- 1. PRE-SCAN (Text Mode) ---
+    uploaded_file.seek(0)
+    text_content = uploaded_file.getvalue().decode("utf-8", errors='replace')
+    lines = text_content.splitlines()
+    
+    # A. Find Statement End Date
+    statement_date = None
+    if len(lines) > 0:
+        match = re.search(r"through\s+(\d{1,2}/\d{1,2}/\d{2,4})", lines[0])
+        if match:
+            try:
+                statement_date = pd.to_datetime(match.group(1)).date()
+            except:
+                statement_date = datetime.now().date()
+        else:
+            statement_date = datetime.now().date()
+
+    # B. Find Net Liquidating Value (Robust CSV Parsing)
+    net_liq_value = 0.0
+    
+    # Use csv.reader to handle quoted numbers like "$1,234.56" correctly
+    reader = csv.reader(lines[:100]) # Scan first 100 lines
+    for row in reader:
+        # row is a list of fields, e.g. ['Net Liquidating Value', '$123,456.78']
+        if any("Net Liquidating Value" in str(cell) for cell in row):
+            for cell in row:
                 try:
-                    # Clean it, try to convert. If it works and isn't 0, we take it.
-                    val = clean_currency(part)
+                    val = clean_currency(cell)
                     if val > 0:
-                        net_liq = val
+                        net_liq_value = val
                         break
-                except:
-                    continue
-            if net_liq > 0: 
+                except: continue
+            if net_liq_value > 0: 
                 break
 
-    # --- 3. LOAD DATAFRAMES ---
-    h_end = sections.get('history_end', len(lines))
-    c_end = sections.get('cash_end', len(lines))
+    # --- 2. LOAD RAW DATA (Pandas Mode) ---
+    uploaded_file.seek(0)
+    df_raw = pd.read_csv(uploaded_file, header=None, low_memory=False)
     
-    def read_section(start, end):
-        raw = "\n".join(lines[start:end])
-        return pd.read_csv(io.StringIO(raw))
+    idx_eq = find_idx(df_raw, "Equities")
+    idx_opt = find_idx(df_raw, "Options")
+    idx_prof = find_idx(df_raw, "Profits and Losses")
+    idx_cash = find_idx(df_raw, "Cash Balance")
+    idx_trade = find_idx(df_raw, "Account Trade History")
 
-    df_history = read_section(sections['history_start'], h_end)
-    df_cash = read_section(sections['cash_start'], c_end)
-
-    # --- 4. EXTRACT CASH TOTALS & CLEANUP ---
-    cash_total = 0.0
+    # --- 3. PARSE POSITIONS (Held on Statement Date) ---
+    current_positions = []
     
-    # Find the TOTAL row (Case Sensitive check)
-    if 'DESCRIPTION' in df_cash.columns:
-        total_row = df_cash[df_cash['DESCRIPTION'] == 'TOTAL']
-        if not total_row.empty:
-            # Assuming 'Amount' or 'Balance' holds the total. Check your CSV header.
-            # Usually the last column is the running balance.
-            # Let's assume user wants the 'Amount' column from the total line
-            cash_total = clean_currency(total_row.iloc[0].get('AMOUNT', 0))
+    # A. Equities
+    if idx_eq:
+        end_eq = idx_opt if idx_opt else (idx_prof if idx_prof else idx_cash)
+        if end_eq:
+            uploaded_file.seek(0)
+            df_equities = pd.read_csv(uploaded_file, skiprows=idx_eq+1, nrows=end_eq-(idx_eq+2))
             
-        # Remove the TOTAL row so it doesn't mess up trade matching
-        df_cash = df_cash[df_cash['DESCRIPTION'] != 'TOTAL']
+            if 'Symbol' in df_equities.columns:
+                df_equities = df_equities.dropna(subset=['Symbol'])
+                for _, row in df_equities.iterrows():
+                    if row['Symbol'] == 'Total': continue
+                    
+                    current_positions.append({
+                        "symbol": clean_text(row['Symbol']),
+                        "description": clean_text(row.get('Description')),
+                        "qty": clean_currency(row.get('Qty')),
+                        "mark_price": clean_currency(row.get('Mark')),
+                        "market_value": clean_currency(row.get('Market Value')),
+                        "asset_type": "STOCK" # Requested Change
+                    })
 
-    # Create the Snapshot Object (return this to app.py later)
-    snapshot_data = {
-        "net_liquidating_value": net_liq,
-        "total_cash_balance": cash_total
-    }
+    # B. Options
+    if idx_opt:
+        end_opt = idx_prof if idx_prof else idx_cash
+        if end_opt:
+            uploaded_file.seek(0)
+            df_options = pd.read_csv(uploaded_file, skiprows=idx_opt+1, nrows=end_opt-(idx_opt+2))
+            
+            col_name = 'Option Code' if 'Option Code' in df_options.columns else 'Symbol'
+            
+            if col_name in df_options.columns:
+                df_options = df_options.dropna(subset=[col_name])
+                for _, row in df_options.iterrows():
+                    if row[col_name] == 'Total': continue
+                    
+                    current_positions.append({
+                        "symbol": clean_text(row[col_name]),
+                        "description": clean_text(row.get('Exp')),
+                        "qty": clean_currency(row.get('Qty')),
+                        "mark_price": clean_currency(row.get('Mark')),
+                        "market_value": clean_currency(row.get('Market Value')),
+                        "asset_type": "OPTION",
+                        "exp_date_str": clean_text(row.get('Exp')),
+                        "strike": clean_currency(row.get('Strike')),
+                        "option_type": clean_text(row.get('Type'))
+                    })
 
-    # --- 5. MERGING LOGIC (TRADES) ---
+    # --- 4. PARSE CASH BALANCE ---
+    snapshots_list = []
+    if idx_cash:
+        nrows = (idx_trade - (idx_cash + 2)) if idx_trade else None
+        
+        uploaded_file.seek(0)
+        df_cash = pd.read_csv(uploaded_file, skiprows=idx_cash+1, nrows=nrows)
+        
+        if 'TYPE' in df_cash.columns:
+            df_bals = df_cash[df_cash['TYPE'] == 'BAL']
+            
+            for _, row in df_bals.iterrows():
+                try:
+                    snap_date = pd.to_datetime(row['DATE']).date()
+                except:
+                    continue
+                
+                is_valid_liq = (snap_date == statement_date)
+                
+                snapshots_list.append({
+                    "snapshot_date": snap_date,
+                    "total_cash_balance": clean_currency(row.get('BALANCE', 0)),
+                    "net_liquidating_value": net_liq_value if is_valid_liq else None,
+                    "is_net_liq_valid": is_valid_liq,
+                    "positions": current_positions if is_valid_liq else []
+                })
+
+    # --- 5. PARSE TRANSACTIONS ---
     transactions = []
-
-    # 1. CLEANUP EMPTY ROWS
-    # First, drop rows that are COMPLETELY empty (all columns are NaN)
-    df_history.dropna(how='all', inplace=True)
-
-    # 2. HANDLE SPREAD GROUPING (The Fix)
-    # Convert empty strings/whitespace to real 'NaN' so Pandas can see them
-    df_history.replace(r'^\s*$', np.nan, regex=True, inplace=True)
-    
-    # Define which columns are safe to copy down from the parent trade
-    # We ONLY want Date, Time, and Spread type. 
-    # We DO NOT want to fill Strike, Exp, or Side.
-    columns_to_fill = ['Exec Time', 'Spread'] # Add 'Date' if your CSV splits them
-    
-    # Check if these columns exist before trying to fill (safety check)
-    existing_cols_to_fill = [c for c in columns_to_fill if c in df_history.columns]
-    
-    # Apply Forward Fill (ffill) only to these specific columns
-    df_history[existing_cols_to_fill] = df_history[existing_cols_to_fill].ffill()
-
-    # 3. NOW it is safe to drop rows that still lack a Date
-    # (This catches truly garbage lines, but preserves the spread legs we just filled)
-    df_history.dropna(subset=['Exec Time'], inplace=True)
-    
-    # --- PART A: STANDARD TRADES (From History) ---
-    for index, trade in df_history.iterrows():
+    if idx_trade:
+        uploaded_file.seek(0)
+        df_history = pd.read_csv(uploaded_file, skiprows=idx_trade+1)
         
-        # 1. Parse Date and Time explicitly
-        raw_datetime = str(trade.get('Exec Time', ''))
+        df_history.replace(r'^\s*$', np.nan, regex=True, inplace=True)
+        columns_to_fill = ['Exec Time', 'Spread']
+        existing_cols = [c for c in columns_to_fill if c in df_history.columns]
+        df_history[existing_cols] = df_history[existing_cols].ffill()
+        df_history.dropna(subset=['Exec Time'], inplace=True)
 
-        # Default values
-        trade_date_str = None
-        trade_time_str = "00:00:00"
+        for index, trade in df_history.iterrows():
+            # Date/Time Logic
+            raw_datetime = str(trade.get('Exec Time', ''))
+            trade_date_str = None
+            trade_time_str = "00:00:00"
 
-        if ' ' in raw_datetime:
-            parts = raw_datetime.split(' ')
-            trade_date_str = parts[0]  # "12/23/2025"
-            trade_time_str = parts[1]  # "9:32"
+            if ' ' in raw_datetime:
+                parts = raw_datetime.split(' ')
+                trade_date_str = parts[0]
+                trade_time_str = parts[1]
+                if len(trade_time_str.split(':')) == 2:
+                    trade_time_str += ":00"
 
-            # Fix: Ensure time has seconds (9:32 -> 9:32:00) for consistency
-            if len(trade_time_str.split(':')) == 2:
-                trade_time_str += ":00"
-        
-        #trade_date_str = trade.get('Exec Time', '').split(' ')[0] 
-        trade_symbol = trade.get('Symbol')
+            trade_symbol = clean_text(trade.get('Symbol'))
 
-        # --- FIX: STRICT MATCHING ---
-        # We use \b (Word Boundary) so "UP" matches " UP " but NOT "GROUP" or "UPON"
-        # We also use re.escape() to handle symbols like "BRK.B" safely
-        safe_symbol = re.escape(str(trade_symbol))
-
-        # Filter matching fees in Cash Balance
-        matches = df_cash[
-            (df_cash['DATE'] == trade_date_str) & 
-            (df_cash['DESCRIPTION'].str.contains(rf'\b{safe_symbol}\b', regex=True, na=False))
-        ]
-        
-        fees = 0.0
-        commissions = 0.0
-        
-        # Capture Description from the matching cash row if it exists
-        cash_desc = None
-        if not matches.empty:
-            cash_desc = matches.iloc[0].get('DESCRIPTION')
-
-        if not matches.empty:
-            # Take the first match as agreed
-            first_match = matches.iloc[0]
-            fees = clean_currency(first_match.get('Misc Fees', 0))
-            commissions = clean_currency(first_match.get('Commissions & Fees', 0))
-        
-        # ---- Calculate cb_amount for the trade type transactions ----
-        # 1. Determine Multiplier (100 for Options, 1 for Stock or ETF)
-        # If the row has an 'Exp', it's for sure an option
-        raw_exp = str(trade.get('Exp', '')).strip()
-        is_option = raw_exp != '' and raw_exp.lower() != 'nan'
-        multiplier = 100 if is_option else 1
-        
-        # 2. Get values safely
-        qty_val = clean_currency(trade.get('Qty'))
-        price_val = clean_currency(trade.get('Price'))
-
-        # 3. The Math: -(Qty * Price * Mult) # Fees can be excluded because they aren't a part of the amount column
-        # Example Buy: -(1 * 5.00 * 100) - 0.65 = -500.65 (Cash leaves account)
-        # Example Sell: -(-1 * 5.00 * 100) - 0.65 = +500 - 0.65 = +499.35 (Cash enters)
-        calculated_net = -(qty_val * price_val * multiplier) #- fees - commissions
-        
-        record = {
-            "Exec_Date": trade_date_str, # We pass the clean string "12/23/2025"
-            "Exec_Time": trade_time_str,
-            "Symbol": trade_symbol,
-            "Qty": qty_val,
-            "Price": price_val,
-            "Side": trade.get('Side'),
+            # Fee Matching
+            fees = 0.0
+            commissions = 0.0
+            cash_desc = None
             
-            # Use lowercase keys to match what we expect in dbfunctions later
-            "spread": trade.get('Spread'),         # Capture Spread
-            "pos_effect": trade.get('Pos Effect'), # Capture Open/Close
-            
-            # --- NEW: Capture Option Data ---
-            # We grab the raw string for Date, handle conversion in dbfunctions
-            "exp_date_str": trade.get('Exp'), # Pass raw "16-Jan-26"
-            "strike": clean_currency(trade.get('Strike')),
-            "option_type": trade.get('Type'), # Call/Put
-            
-            # --- NEW: Cash Data ---
-            "cb_description": cash_desc,
-            "cb_misc_fees": fees,
-            "cb_commissions": commissions,
-            "cb_amount": calculated_net, # Calulating cb_amount for trades to avoid reading it from cash balance
-            
-            # --- RENAMED: Avoid conflict with Option 'Type' column ---
-            "transaction_type": "TRADE" 
-        }
-        record['row_hash'] = generate_hash(record)
-        transactions.append(record)
+            if 'df_cash' in locals():
+                safe_symbol = re.escape(str(trade_symbol)) if trade_symbol else ""
+                if safe_symbol:
+                    matches = df_cash[
+                        (df_cash['DATE'] == trade_date_str) & 
+                        (df_cash['DESCRIPTION'].str.contains(rf'\b{safe_symbol}\b', regex=True, na=False))
+                    ]
+                    if not matches.empty:
+                        fees = matches['Misc Fees'].apply(clean_currency).sum()
+                        commissions = matches['Commissions & Fees'].apply(clean_currency).sum()
+                        cash_desc = clean_text(matches.iloc[0].get('DESCRIPTION'))
 
-    # --- PART B: ASSIGNMENTS / EXPIRATIONS (From Cash Balance) ---
-    # Filter for TYPE == 'EXP' (Expiration/Assignment/Exercise)
-    if 'TYPE' in df_cash.columns:
-        assignment_rows = df_cash[df_cash['TYPE'] == 'EXP']
-        
-        for index, row in assignment_rows.iterrows():
-            desc = row.get('DESCRIPTION', '')
-            amount = clean_currency(row.get('AMOUNT', 0))
+            # Calculation
+            raw_exp = str(trade.get('Exp', '')).strip()
+            is_option = (raw_exp != '' and raw_exp.lower() != 'nan') or (pd.notna(trade.get('Spread')) and trade.get('Spread') != 'STOCK')
+            multiplier = 100 if is_option else 1
             
-            # Skip if amount is 0 (Pure Expiration usually has 0 cash flow)
-            if amount == 0:
-                continue
+            qty_val = clean_currency(trade.get('Qty'))
+            price_val = clean_currency(trade.get('Price'))
+            calculated_net = -(qty_val * price_val * multiplier) - fees - commissions
 
-            # Regex to Parse: "SOLD -100.0 LAC UPON..." or "BOT 100 LAC..."
-            # Pattern: Look for (SOLD or BOT) followed by a Number, then the Ticker
-            match = re.search(r'(SOLD|BOT)\s+([-\d\.]+)\s+(\w+)', desc)
-            
-            if match:
-                side_str = match.group(1) # "SOLD" or "BOT"
-                qty_str = match.group(2)  # "-100.0" or "100"
-                symbol_str = match.group(3) # "LAC"
-                
-                qty = float(qty_str)
-                
-                # Calculate Price per share
-                # Avoid division by zero
-                price = 0.0
-                if qty != 0:
-                    price = abs(amount / qty)
+            record = {
+                "Exec_Date": trade_date_str,
+                "Exec_Time": trade_time_str,
+                "Symbol": trade_symbol,
+                "Qty": qty_val,
+                "Price": price_val,
+                "Side": clean_text(trade.get('Side')),
+                "spread": clean_text(trade.get('Spread')),
+                "pos_effect": clean_text(trade.get('Pos Effect')),
+                "exp_date_str": clean_text(trade.get('Exp')),
+                "strike": clean_currency(trade.get('Strike')),
+                "option_type": clean_text(trade.get('Type')),
+                "cb_description": cash_desc,
+                "cb_misc_fees": fees,
+                "cb_commissions": commissions,
+                "cb_amount": calculated_net,
+                "transaction_type": "TRADE"
+            }
+            record['row_hash'] = generate_hash(record)
+            transactions.append(record)
 
-                # Map "BOT/SOLD" to "BUY/SELL" for consistency
-                final_side = "SELL" if side_str == "SOLD" else "BUY"
-
-                assign_record = {
-                    "Exec_Date": row.get('DATE'),
-                    "Exec_Time": "00:00:00", # Cash balance usually has no time
-                    "Symbol": symbol_str,
-                    "Qty": qty,
-                    "Price": price,
-                    "Side": final_side,
-                    "cb_misc_fees": clean_currency(row.get('Misc Fees', 0)),
-                    "cb_commissions": 0.0, # Assignments usually have no comms
-                    #"Type": "ASSIGNMENT",
-                    "transaction_type": "ASSIGNMENT",
-                    "cb_amount": amount # Useful to track the raw cash impact
-                }
-                assign_record['row_hash'] = generate_hash(assign_record)
-                transactions.append(assign_record)
-
-    return pd.DataFrame(transactions), snapshot_data
+    return transactions, snapshots_list
