@@ -2,3 +2,7 @@ archive/
 data/
 __pycache__/
 *.pyc
+launch.json
+.vscode/
+*.csv
+*.db
