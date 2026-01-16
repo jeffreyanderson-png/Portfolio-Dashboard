@@ -6,27 +6,49 @@ from src.models import Transaction, AccountSnapshot, PositionSnapshot, Campaign,
 def create_engine_func(db_url):
     return create_engine(db_url)
 
+def parse_multi_format_date(date_str):
+    """
+    Parses dates like '30 JAN 26' (ToS), '16-Jan-26', or '1/16/2026'.
+    """
+    if not date_str or str(date_str).lower() == 'nan':
+        return None
+    
+    # FIX: Convert "30 JAN 26" -> "30 Jan 26" for python parsing
+    date_str = str(date_str).strip().title()
+    
+    formats = [
+        '%d %b %y',  # 30 Jan 26
+        '%d-%b-%y',  # 16-Jan-26
+        '%m/%d/%y',  # 1/16/26
+        '%m/%d/%Y',  # 01/16/2026
+        '%Y-%m-%d'   # 2026-01-16
+    ]
+    
+    for fmt in formats:
+        try:
+            dt = pd.to_datetime(date_str, format=fmt)
+            if pd.notna(dt):
+                return dt.date()
+        except:
+            continue
+            
+    # Fallback
+    try:
+        dt = pd.to_datetime(date_str)
+        if pd.notna(dt):
+            return dt.date()
+    except:
+        return None
+
 def save_import_data(engine, transactions_list: list, snapshots_list: list):
-    """
-    Saves parsed transactions and daily snapshots/positions.
-    Includes Self-Healing logic for existing trades.
-    """
-    stats = {
-        "trades_added": 0,
-        "trades_skipped": 0,
-        "trades_healed": 0,
-        "snapshots_processed": 0,
-        "positions_added": 0
-    }
+    stats = {"trades_added": 0, "trades_skipped": 0, "trades_healed": 0, "snapshots_processed": 0, "positions_added": 0}
 
     with Session(engine) as session:
         # --- 1. SNAPSHOTS & POSITIONS ---
         for snap_data in snapshots_list:
             snap_date = snap_data['snapshot_date']
             
-            existing_snap = session.exec(
-                select(AccountSnapshot).where(AccountSnapshot.snapshot_date == snap_date)
-            ).first()
+            existing_snap = session.exec(select(AccountSnapshot).where(AccountSnapshot.snapshot_date == snap_date)).first()
             current_snap = existing_snap
             
             if not existing_snap:
@@ -50,20 +72,12 @@ def save_import_data(engine, transactions_list: list, snapshots_list: list):
                     session.commit()
 
             if snap_data['positions']:
-                existing_positions = session.exec(
-                    select(PositionSnapshot).where(PositionSnapshot.snapshot_id == current_snap.id)
-                ).all()
-                for p in existing_positions:
-                    session.delete(p)
+                existing_positions = session.exec(select(PositionSnapshot).where(PositionSnapshot.snapshot_id == current_snap.id)).all()
+                for p in existing_positions: session.delete(p)
                 
                 for pos in snap_data['positions']:
-                    exp_date_obj = None
-                    if pos.get('exp_date_str'):
-                        try:
-                            dt = pd.to_datetime(pos['exp_date_str'], format='%d-%b-%y')
-                            if pd.notna(dt):
-                                exp_date_obj = dt.date()
-                        except: pass
+                    # Use the new robust parser
+                    exp_date_obj = parse_multi_format_date(pos.get('exp_date_str'))
 
                     new_pos = PositionSnapshot(
                         snapshot_id=current_snap.id,
@@ -75,7 +89,11 @@ def save_import_data(engine, transactions_list: list, snapshots_list: list):
                         asset_type=pos['asset_type'],
                         exp_date=exp_date_obj,
                         strike=pos.get('strike'),
-                        option_type=pos.get('option_type')
+                        option_type=pos.get('option_type'),
+                        option_code=pos.get('option_code'),
+                        trade_price=pos.get('trade_price'),
+                        pl_open=pos.get('pl_open'),
+                        pl_pct=pos.get('pl_pct')
                     )
                     session.add(new_pos)
                     stats['positions_added'] += 1
@@ -83,34 +101,16 @@ def save_import_data(engine, transactions_list: list, snapshots_list: list):
 
         # --- 2. TRANSACTIONS ---
         for row in transactions_list:
-            
-            # --- DATE PARSING ---
-            exec_date_obj = None
-            if row.get('Exec_Date'):
-                try:
-                    dt = pd.to_datetime(row['Exec_Date'], format='%m/%d/%Y')
-                    if pd.notna(dt): exec_date_obj = dt.date()
-                except:
-                    try:
-                        dt = pd.to_datetime(row['Exec_Date'])
-                        if pd.notna(dt): exec_date_obj = dt.date()
-                    except: pass
-
+            exec_date_obj = parse_multi_format_date(row.get('Exec_Date'))
             exec_time_obj = None
             if row.get('Exec_Time'):
                 try:
                     dt = pd.to_datetime(str(row['Exec_Time']))
                     if pd.notna(dt): exec_time_obj = dt.time()
                 except: pass
-                
-            exp_date_obj = None
-            if row.get('exp_date_str'):
-                try:
-                    dt = pd.to_datetime(row['exp_date_str'], format='%d-%b-%y')
-                    if pd.notna(dt): exp_date_obj = dt.date()
-                except: pass
+            
+            exp_date_obj = parse_multi_format_date(row.get('exp_date_str'))
 
-            # --- CREATE OBJECT (Must happen BEFORE the check) ---
             transaction = Transaction(
                 exec_date=exec_date_obj,
                 exec_time=exec_time_obj,
@@ -129,39 +129,19 @@ def save_import_data(engine, transactions_list: list, snapshots_list: list):
                 cb_description=row.get('cb_description'),
                 row_hash=row['row_hash'],
                 transaction_type=row.get('transaction_type', 'TRADE'),
-
-                # NEW VALIDATION FIELDS
                 manual_review=row.get('manual_review', False),
                 review_reason=row.get('review_reason')
             )
 
-            # --- SELF-HEALING LOGIC ---
-            # Check if this trade already exists
-            existing_trade = session.exec(
-                select(Transaction).where(Transaction.row_hash == transaction.row_hash)
-            ).first()
-
-            if existing_trade:
-                # If we found a description now that we missed before, UPDATE it
-                if not existing_trade.cb_description and transaction.cb_description:
-                    existing_trade.cb_description = transaction.cb_description
-                    existing_trade.cb_misc_fees = transaction.cb_misc_fees
-                    existing_trade.cb_commissions = transaction.cb_commissions
-                    existing_trade.cb_amount = transaction.cb_amount # Update math
-                    
-                    session.add(existing_trade)
-                    session.commit()
-                    stats['trades_healed'] += 1
-                else:
-                    stats['trades_skipped'] += 1
-            else:
-                # Insert New
+            existing_trade = session.exec(select(Transaction).where(Transaction.row_hash == transaction.row_hash)).first()
+            if not existing_trade:
                 try:
                     session.add(transaction)
                     session.commit()
                     stats['trades_added'] += 1
                 except IntegrityError:
                     session.rollback()
-                    stats['trades_skipped'] += 1
+            else:
+                 stats['trades_skipped'] += 1
                 
     return stats

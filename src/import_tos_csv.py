@@ -7,7 +7,7 @@ import io
 import csv 
 
 # --- CONFIG ---
-DEBUG_MODE = False # Set to True to see why specific trades fail matching
+DEBUG_MODE = False 
 
 def generate_hash(record_dict):
     raw_str = "".join(str(val) for val in record_dict.values())
@@ -18,6 +18,14 @@ def clean_currency(val):
         if pd.isna(val): return 0.0
         return float(val)
     val = str(val).replace('$', '').replace(',', '').replace('(', '-').replace(')', '').strip()
+    if val == '' or val.lower() == 'nan': return 0.0
+    try: return float(val)
+    except ValueError: return 0.0
+
+def clean_percent(val):
+    """Cleans percentage strings like '+93.40%' -> 93.40"""
+    if pd.isna(val): return 0.0
+    val = str(val).replace('%', '').replace(',', '').replace('+', '').strip()
     if val == '' or val.lower() == 'nan': return 0.0
     try: return float(val)
     except ValueError: return 0.0
@@ -97,7 +105,7 @@ def parse_file(uploaded_file):
                         break
                 except: pass
     
-    # --- 2. LOAD RAW DATA ---
+    # --- 2. LOAD RAW DATA --- 
     uploaded_file.seek(0)
     dummy_cols = list(range(100)) 
     df_raw = pd.read_csv(uploaded_file, header=None, names=dummy_cols, engine='python')
@@ -128,48 +136,73 @@ def parse_file(uploaded_file):
 
     df_equities = pd.DataFrame()
     if idx_eq is not None:
-        df_equities = extract_section(df_raw, idx_eq, get_end_idx(idx_eq), ["Symbol"])
+        # Look for "Symbol" in Equities
+        df_equities = extract_section(df_raw, idx_eq, get_end_idx(idx_eq), ["Symbol", "Qty"])
 
     df_options = pd.DataFrame()
     if idx_opt is not None:
-        df_options = extract_section(df_raw, idx_opt, get_end_idx(idx_opt), ["Option Code", "Symbol"])
+        # Look for columns provided by user: Symbol, Type, Exp, Strike, Option Code
+        df_options = extract_section(df_raw, idx_opt, get_end_idx(idx_opt), ["Option Code", "Symbol", "Strike"])
 
     df_history = pd.DataFrame()
     if idx_trade is not None:
         df_history = extract_section(df_raw, idx_trade, get_end_idx(idx_trade), ["Exec Time", "DATE", "Date"])
 
-    # --- 5. PARSE POSITIONS ---
+    # --- 5. PARSE POSITIONS (DIRECT COLUMN MAPPING) ---
     current_positions = []
     
+    # A. Equities
     if not df_equities.empty and 'Symbol' in df_equities.columns:
         df_equities = df_equities.dropna(subset=['Symbol'])
         for _, row in df_equities.iterrows():
             if str(row['Symbol']) == 'Total': continue
+            
+            # Use 'Description' if available
+            desc = clean_text(row.get('Description'))
+            
             current_positions.append({
                 "symbol": clean_text(row['Symbol']),
-                "description": clean_text(row.get('Description')),
+                "description": desc,
                 "qty": clean_currency(row.get('Qty')),
-                "mark_price": clean_currency(row.get('Mark')),
+                "mark_price": clean_currency(row.get('Mark') or row.get('Market Price') or row.get('Trade Price')), # Mapping fallback
                 "market_value": clean_currency(row.get('Market Value')),
-                "asset_type": "STOCK" 
+                "asset_type": "STOCK",
+                # New Fields
+                "trade_price": clean_currency(row.get('Trade Price')),
+                "pl_open": clean_currency(row.get('P/L Open')),
+                "pl_pct": clean_percent(row.get('P/L %'))
             })
 
+    # B. Options
     if not df_options.empty:
-        col_name = 'Option Code' if 'Option Code' in df_options.columns else 'Symbol'
-        if col_name in df_options.columns:
-            df_options = df_options.dropna(subset=[col_name])
+        # We rely on specific columns now
+        if 'Symbol' in df_options.columns:
+            df_options = df_options.dropna(subset=['Symbol'])
             for _, row in df_options.iterrows():
-                if str(row[col_name]) == 'Total': continue
+                if str(row['Symbol']) == 'Total': continue
+                
+                # Direct Column Mapping
+                sym = clean_text(row.get('Symbol'))  # ASTS
+                type_code = clean_text(row.get('Type')) # PUT
+                exp_str = clean_text(row.get('Exp')) # 30 JAN 26
+                strike_val = clean_currency(row.get('Strike')) # 76
+                opt_code = clean_text(row.get('Option Code')) # ASTS260130P76
+
                 current_positions.append({
-                    "symbol": clean_text(row[col_name]),
-                    "description": clean_text(row.get('Exp')),
+                    "symbol": sym, 
+                    "description": exp_str, # Use Exp string as description for now
                     "qty": clean_currency(row.get('Qty')),
-                    "mark_price": clean_currency(row.get('Mark')),
+                    "mark_price": clean_currency(row.get('Mark') or row.get('Market Price') or row.get('Trade Price')),
                     "market_value": clean_currency(row.get('Market Value')),
                     "asset_type": "OPTION",
-                    "exp_date_str": clean_text(row.get('Exp')),
-                    "strike": clean_currency(row.get('Strike')),
-                    "option_type": clean_text(row.get('Type'))
+                    "exp_date_str": exp_str,
+                    "strike": strike_val,
+                    "option_type": type_code,
+                    # New Fields
+                    "option_code": opt_code,
+                    "trade_price": clean_currency(row.get('Trade Price')),
+                    "pl_open": clean_currency(row.get('P/L Open')),
+                    "pl_pct": clean_percent(row.get('P/L %'))
                 })
 
     # --- 6. PARSE SNAPSHOTS ---
@@ -192,7 +225,7 @@ def parse_file(uploaded_file):
                     "positions": current_positions if is_valid_liq else []
                 })
 
-    # --- 7. PARSE TRANSACTIONS ---
+    # --- 7. PARSE TRANSACTIONS (Unchanged logic, just simplified helper call) ---
     transactions = []
     
     if not df_cash.empty:
@@ -243,8 +276,6 @@ def parse_file(uploaded_file):
                     exp_val = clean_text(trade.get('Exp') or trade.get('EXP'))
                     spread_val = clean_text(trade.get('Spread') or trade.get('SPREAD'))
                     
-                    # --- FUND FIX ---
-                    # Treat 'FUND' exactly like 'STOCK' (Multiplier 1)
                     spread_check = str(spread_val).strip().upper()
                     is_stock_spread = spread_val and spread_check in ['STOCK', 'FUND']
                     is_option = (exp_val is not None) or (spread_val is not None and not is_stock_spread)
@@ -263,9 +294,8 @@ def parse_file(uploaded_file):
                 if not df_cash.empty and trade_symbol and trade_dt_obj and desc_col:
                     safe_symbol = re.escape(str(trade_symbol))
                     start_date = trade_dt_obj
-                    end_date = trade_dt_obj + timedelta(days=5) # Expanded to 5 for Funds
+                    end_date = trade_dt_obj + timedelta(days=5) 
                     
-                    # Try Regex first
                     candidates = df_cash[
                         (df_cash['dt_obj'] >= start_date) & 
                         (df_cash['dt_obj'] <= end_date) &
@@ -273,7 +303,6 @@ def parse_file(uploaded_file):
                         (df_cash[desc_col].astype(str).str.contains(rf'\b{safe_symbol}\b', regex=True, na=False))
                     ]
                     
-                    # Fallback: Simple text search if regex fails (Handles "FUND (SWPPX)")
                     if candidates.empty:
                         candidates = df_cash[
                             (df_cash['dt_obj'] >= start_date) & 
@@ -303,7 +332,6 @@ def parse_file(uploaded_file):
 
                 # 3. GENERATE RECORDS
                 for i, (index, trade) in enumerate(group.iterrows()):
-                    # Re-extract
                     raw_datetime = str(trade.get('Exec Time', ''))
                     trade_date_str, trade_time_str = None, "00:00:00"
                     if ' ' in raw_datetime:
@@ -324,7 +352,6 @@ def parse_file(uploaded_file):
                         else:
                             row_desc = cluster_desc + " (Spread Part)"
                     else:
-                        # TIER 2: INDIVIDUAL MATCH
                         if not candidates.empty:
                             live_candidates = df_cash.loc[candidates.index]
                             live_candidates = live_candidates[~live_candidates['is_matched']]
@@ -351,20 +378,15 @@ def parse_file(uploaded_file):
                                     is_matched = True
                                     match_diff = best_diff
                     
-                    # Validation Logic
                     manual_review = False
                     review_reason = None
-                    
                     if not is_matched:
                         manual_review = True
                         review_reason = "No Cash Match Found"
-                        if DEBUG_MODE:
-                            print(f"DEBUG FAIL: {trade_symbol} | Expect: {gross_leg_amount}")
                     elif match_diff > 5.0 and not cluster_matched:
                         manual_review = True
                         review_reason = f"Math Mismatch: Diff ${match_diff:.2f}"
 
-                    # Record Generation
                     qty_val = clean_currency(trade.get('Qty'))
                     price_val = clean_currency(trade.get('Price'))
                     exp_val = clean_text(trade.get('Exp') or trade.get('EXP'))

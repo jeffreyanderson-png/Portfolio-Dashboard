@@ -8,15 +8,13 @@ import os
 from sqlmodel import SQLModel, create_engine, Session
 
 # --- SETUP: Make sure we can find the 'src' folder ---
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+#import sys
+#sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 # --- LOCAL IMPORTS ---
-# We import these AFTER adding 'src' to the path
-import dbfunctions
-import import_tos_csv
+import src.dbfunctions as dbfunctions
+import src.import_tos_csv as import_tos_csv
 from src.models import Transaction, AccountSnapshot
-from src import dbfunctions
 from src import seed_data
 from src.dbfunctions import create_engine_func # Ensure you have this import
 
@@ -31,7 +29,7 @@ st.set_page_config(
 DB_FOLDER = "data"
 DB_FILE = "portfolio.db"
 DB_PATH = os.path.join(DB_FOLDER, DB_FILE)
-# SQLModel needs a URL format for the engine (sqlite:///path/to/db)
+# SQLModel needs a URL format for the engine (sqlite:///path/to/db) 
 DB_URL = f"sqlite:///{DB_PATH}"
 
 # --- INITIALIZATION ---
@@ -54,7 +52,7 @@ def init_db():
 # --- MAIN APP LOGIC ---
 def main():
     st.title("✈️ Pilot Portfolio Manager v2.1")
-    # Ensure DB tables exist before we do anything else
+    # Ensure DB tables exist before we do anything else 
     init_db()
     
     # Sidebar for Navigation

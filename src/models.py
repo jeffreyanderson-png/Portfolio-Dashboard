@@ -22,12 +22,12 @@ class SymbolSettings(SQLModel, table=True):
     # Default Strategy for this symbol
     default_strategy_id: Optional[int] = Field(default=None, foreign_key="strategy.id")
     default_strategy: Optional[Strategy] = Relationship(back_populates="symbol_defaults")
-    
     notes: Optional[str] = None # General notes on the ticker
 
 # --- 2. CAMPAIGN MANAGEMENT ---
 class Campaign(SQLModel, table=True):
     """A specific instance of a strategy (e.g., 'GOOG Wheel Jan 2026')"""
+    __table_args__ = {"extend_existing": True}
     __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str 
@@ -82,7 +82,6 @@ class Transaction(SQLModel, table=True):
     manual_review: bool = Field(default=False)
     review_reason: Optional[str] = None
     
-    # NEW: Link to Campaign (The "Bucket")
     campaign_id: Optional[int] = Field(default=None, foreign_key="campaign.id")
     campaign: Optional[Campaign] = Relationship(back_populates="transactions")
 
@@ -112,6 +111,8 @@ class PositionSnapshot(SQLModel, table=True):
     strike: Optional[float] = None
     option_type: Optional[str] = None
     
-    # Cached Strategy Name (Optional, for quick filtering on the dashboard without joining)
-    # Alternatively, we could link Position -> Campaign, but positions are ephemeral snapshots.
-    # For now, let's keep it simple.
+    # --- NEW FIELDS FROM CSV ---
+    option_code: Optional[str] = None
+    trade_price: Optional[float] = None # Cost basis
+    pl_open: Optional[float] = None
+    pl_pct: Optional[float] = None
