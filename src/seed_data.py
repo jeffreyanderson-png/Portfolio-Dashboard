@@ -14,28 +14,34 @@ DEFAULT_STRATEGIES = [
     "Lotto Ticket" 
 ]
 
-def seed_strategies(db_url="sqlite:///portfolio.db"):
+#def seed_strategies(db_url="sqlite:///portfolio.db"):
+def seed_strategies(db_url):
+    if not db_url.startswith("sqlite"):
+        db_url = f"sqlite:///{db_url}"
+        
     engine = create_engine(db_url)
     
-    # --- CRITICAL FIX: CREATE TABLES IF THEY DON'T EXIST ---
+    # --- CREATE TABLES IF THEY DON'T EXIST ---
     # This checks the database structure and builds missing tables (like 'strategy')
     SQLModel.metadata.create_all(engine)
     
-    print("🌱 Seeding Database with Default Strategies...")
-    
     with Session(engine) as session:
+        changes_made = False # <--- THE KEY FIX
+        
         for strat_name in DEFAULT_STRATEGIES:
-            # Check if exists to prevent duplicates
             existing = session.exec(select(Strategy).where(Strategy.name == strat_name)).first()
             
             if not existing:
                 print(f"   [+] Adding: {strat_name}")
                 session.add(Strategy(name=strat_name))
-            else:
-                pass
+                changes_made = True 
         
-        session.commit()
-    print("✅ Seeding Complete!")
+        if changes_made:
+            session.commit() # Only write if data changed
+            print("✅ Seeding Complete! (Changes Saved)")
+        else:
+            print("✅ Database up to date. (Skipping write)")
 
 if __name__ == "__main__":
-    seed_strategies()
+    seed_strategies("sqlite:///data/portfolio.db")
+    

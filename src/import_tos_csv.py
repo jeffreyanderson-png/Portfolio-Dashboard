@@ -10,14 +10,73 @@ import csv
 DEBUG_MODE = False 
 
 def generate_hash(record_dict):
-    raw_str = "".join(str(val) for val in record_dict.values())
+    """
+    Creates a unique ID based ONLY on the immutable facts.
+    Includes "Scorched Earth" normalization to fix invisible formatting issues.
+    """
+    # 1. DATE NORMALIZATION
+    # Forces '1/16/26', '2026-01-16', and 'Jan 16, 2026' all to -> '2026-01-16'
+    raw_date = record_dict.get('Exec_Date', '')
+    try:
+        if pd.notna(raw_date) and str(raw_date).strip() != '':
+            date_str = pd.to_datetime(raw_date).strftime('%Y-%m-%d')
+        else:
+            date_str = "0000-00-00"
+    except:
+        date_str = str(raw_date).strip()
+
+    # 2. TIME NORMALIZATION
+    # Forces '9:30', '09:30:00', '9:30:05' all to -> '09:30'
+    raw_time = str(record_dict.get('Exec_Time', '')).strip()
+    time_str = "00:00"
+    if ':' in raw_time:
+        parts = raw_time.split(':')
+        # Pads hours (9 -> 09) and grabs just HH:MM
+        h = parts[0].strip().zfill(2)
+        m = parts[1].strip().zfill(2)
+        time_str = f"{h}:{m}"
+    
+    # 3. TEXT NORMALIZATION (Strip whitespace & uppercase)
+    symbol = str(record_dict.get('Symbol', '')).upper().strip()
+    side = str(record_dict.get('Side', '')).upper().strip()
+    
+    # 4. NUMBER NORMALIZATION (4 decimal places)
+    try:
+        qty = float(record_dict.get('Qty', 0))
+        qty_str = f"{qty:.4f}"
+    except:
+        qty_str = "0.0000"
+
+    try:
+        price = float(record_dict.get('Price', 0))
+        price_str = f"{price:.4f}"
+    except:
+        price_str = "0.0000"
+
+    # 5. GENERATE HASH
+    # We add a DEBUG print here so you can check your terminal if it fails again
+    raw_str = f"{date_str}|{time_str}|{symbol}|{side}|{qty_str}|{price_str}"
+    
+    # UNCOMMENT THE LINE BELOW TO SEE THE "INVISIBLE" DATA IN YOUR TERMINAL
+    # print(f"HASHING: {raw_str}") 
+    
     return hashlib.md5(raw_str.encode()).hexdigest()
 
 def clean_currency(val):
+    """
+    Converts currency strings to floats.
+    Handles standard formats ($1,000.00) and Accounting formats ($1000.00).
+    """
     if isinstance(val, (int, float)):
         if pd.isna(val): return 0.0
         return float(val)
-    val = str(val).replace('$', '').replace(',', '').replace('(', '-').replace(')', '').strip()
+    # Remove common currency symbols
+    val = str(val).replace('$', '').replace(',', '')
+    # Handle Accounting Negative: (23.50) -> -23.50
+    if '(' in val and ')' in val:
+        val = val.replace('(', '-').replace(')', '')
+    
+    val = val.strip()
     if val == '' or val.lower() == 'nan': return 0.0
     try: return float(val)
     except ValueError: return 0.0
@@ -105,7 +164,7 @@ def parse_file(uploaded_file):
                         break
                 except: pass
     
-    # --- 2. LOAD RAW DATA --- 
+    # --- 2. LOAD RAW DATA ---
     uploaded_file.seek(0)
     dummy_cols = list(range(100)) 
     df_raw = pd.read_csv(uploaded_file, header=None, names=dummy_cols, engine='python')
@@ -136,19 +195,18 @@ def parse_file(uploaded_file):
 
     df_equities = pd.DataFrame()
     if idx_eq is not None:
-        # Look for "Symbol" in Equities
         df_equities = extract_section(df_raw, idx_eq, get_end_idx(idx_eq), ["Symbol", "Qty"])
 
     df_options = pd.DataFrame()
     if idx_opt is not None:
-        # Look for columns provided by user: Symbol, Type, Exp, Strike, Option Code
-        df_options = extract_section(df_raw, idx_opt, get_end_idx(idx_opt), ["Option Code", "Symbol", "Strike"])
+        # UPDATED: Added "Mark" and "Mark Value" to extraction list
+        df_options = extract_section(df_raw, idx_opt, get_end_idx(idx_opt), ["Option Code", "Symbol", "Trade Price", "P/L Open", "Mark", "Mark Value"])
 
     df_history = pd.DataFrame()
     if idx_trade is not None:
         df_history = extract_section(df_raw, idx_trade, get_end_idx(idx_trade), ["Exec Time", "DATE", "Date"])
 
-    # --- 5. PARSE POSITIONS (DIRECT COLUMN MAPPING) ---
+    # --- 5. PARSE POSITIONS ---
     current_positions = []
     
     # A. Equities
@@ -157,53 +215,80 @@ def parse_file(uploaded_file):
         for _, row in df_equities.iterrows():
             if str(row['Symbol']) == 'Total': continue
             
-            # Use 'Description' if available
-            desc = clean_text(row.get('Description'))
+            qty = clean_currency(row.get('Qty'))
+            trade_price = clean_currency(row.get('Trade Price'))
+            pl_open = clean_currency(row.get('P/L Open'))
             
+            # Universal Lookup: Checks 'Market Value', then 'Mark Value', then Calculates
+            market_val = clean_currency(row.get('Market Value') or row.get('Mark Value'))
+            
+            if market_val == 0.0 and pl_open != 0.0:
+                market_val = (qty * trade_price) + pl_open
+
+            # Universal Mark: Checks 'Mark', 'Market Price', 'Trade Price', then Calculates
+            mark = clean_currency(row.get('Mark') or row.get('Market Price') or row.get('Trade Price'))
+            
+            if market_val != 0.0 and qty != 0:
+                calc_mark = abs(market_val / qty)
+                if mark == 0.0 or abs(mark - calc_mark) > 0.1:
+                     mark = calc_mark
+
             current_positions.append({
                 "symbol": clean_text(row['Symbol']),
-                "description": desc,
-                "qty": clean_currency(row.get('Qty')),
-                "mark_price": clean_currency(row.get('Mark') or row.get('Market Price') or row.get('Trade Price')), # Mapping fallback
-                "market_value": clean_currency(row.get('Market Value')),
+                "description": clean_text(row.get('Description')),
+                "qty": qty,
+                "mark_price": mark,
+                "market_value": market_val,
                 "asset_type": "STOCK",
-                # New Fields
-                "trade_price": clean_currency(row.get('Trade Price')),
-                "pl_open": clean_currency(row.get('P/L Open')),
+                "trade_price": trade_price,
+                "pl_open": pl_open,
                 "pl_pct": clean_percent(row.get('P/L %'))
             })
 
     # B. Options
-    if not df_options.empty:
-        # We rely on specific columns now
-        if 'Symbol' in df_options.columns:
-            df_options = df_options.dropna(subset=['Symbol'])
-            for _, row in df_options.iterrows():
-                if str(row['Symbol']) == 'Total': continue
-                
-                # Direct Column Mapping
-                sym = clean_text(row.get('Symbol'))  # ASTS
-                type_code = clean_text(row.get('Type')) # PUT
-                exp_str = clean_text(row.get('Exp')) # 30 JAN 26
-                strike_val = clean_currency(row.get('Strike')) # 76
-                opt_code = clean_text(row.get('Option Code')) # ASTS260130P76
+    if not df_options.empty and 'Symbol' in df_options.columns:
+        df_options = df_options.dropna(subset=['Symbol'])
+        for _, row in df_options.iterrows():
+            if str(row['Symbol']) == 'Total': continue
+            
+            qty = clean_currency(row.get('Qty'))
+            trade_price = clean_currency(row.get('Trade Price'))
+            pl_open = clean_currency(row.get('P/L Open'))
+            
+            # --- UPDATED LOGIC FOR NEW COLUMNS ---
+            # 1. Try to get direct value ('Mark Value' or 'Market Value')
+            market_val = clean_currency(row.get('Mark Value') or row.get('Market Value'))
+            
+            # 2. Fallback: Calculate if missing
+            if market_val == 0.0 and (pl_open != 0.0 or trade_price != 0.0):
+                cost_basis = qty * trade_price * 100
+                market_val = cost_basis + pl_open
+            
+            # 3. Try to get direct Mark
+            mark = clean_currency(row.get('Mark') or row.get('Market Price'))
+            
+            # 4. Fallback: Calculate Mark from Market Value
+            if mark == 0.0 and market_val != 0.0 and qty != 0:
+                mark = abs(market_val / (qty * 100))
+            
+            # 5. Last Resort: Use Trade Price
+            if mark == 0.0: mark = trade_price
 
-                current_positions.append({
-                    "symbol": sym, 
-                    "description": exp_str, # Use Exp string as description for now
-                    "qty": clean_currency(row.get('Qty')),
-                    "mark_price": clean_currency(row.get('Mark') or row.get('Market Price') or row.get('Trade Price')),
-                    "market_value": clean_currency(row.get('Market Value')),
-                    "asset_type": "OPTION",
-                    "exp_date_str": exp_str,
-                    "strike": strike_val,
-                    "option_type": type_code,
-                    # New Fields
-                    "option_code": opt_code,
-                    "trade_price": clean_currency(row.get('Trade Price')),
-                    "pl_open": clean_currency(row.get('P/L Open')),
-                    "pl_pct": clean_percent(row.get('P/L %'))
-                })
+            current_positions.append({
+                "symbol": clean_text(row.get('Symbol')), 
+                "description": clean_text(row.get('Exp')), 
+                "qty": qty,
+                "mark_price": mark,
+                "market_value": market_val,
+                "asset_type": "OPTION",
+                "exp_date_str": clean_text(row.get('Exp')),
+                "strike": clean_currency(row.get('Strike')),
+                "option_type": clean_text(row.get('Type')),
+                "option_code": clean_text(row.get('Option Code')),
+                "trade_price": trade_price,
+                "pl_open": pl_open,
+                "pl_pct": clean_percent(row.get('P/L %'))
+            })
 
     # --- 6. PARSE SNAPSHOTS ---
     snapshots_list = []
@@ -225,112 +310,84 @@ def parse_file(uploaded_file):
                     "positions": current_positions if is_valid_liq else []
                 })
 
-    # --- 7. PARSE TRANSACTIONS (Unchanged logic, just simplified helper call) ---
+    # --- 7. PARSE TRANSACTIONS (Re-included for completeness) ---
     transactions = []
     
     if not df_cash.empty:
         amt_col = 'AMOUNT' if 'AMOUNT' in df_cash.columns else ('Amount' if 'Amount' in df_cash.columns else None)
         desc_col = 'DESCRIPTION' if 'DESCRIPTION' in df_cash.columns else ('Description' if 'Description' in df_cash.columns else None)
-        
         if amt_col: df_cash['clean_amount'] = df_cash[amt_col].apply(clean_currency)
         else: df_cash['clean_amount'] = 0.0
-        
         df_cash['is_matched'] = False
         df_cash['match_id'] = df_cash.index
 
     if not df_history.empty:
-        # Safe Fill
         for c in ['Exec Time', 'Spread']:
-            if c in df_history.columns:
-                df_history[c] = df_history[c].replace(r'^\s*$', np.nan, regex=True).ffill()
-        
+            if c in df_history.columns: df_history[c] = df_history[c].replace(r'^\s*$', np.nan, regex=True).ffill()
         if 'Exec Time' in df_history.columns:
             df_history.dropna(subset=['Exec Time'], inplace=True)
-            
-            # Safe Group Fill
             def group_fill(group):
                 cols = [c for c in ['Symbol', 'Exp'] if c in group.columns]
                 group[cols] = group[cols].replace(r'^\s*$', np.nan, regex=True).ffill()
                 return group
-            
             df_history = df_history.groupby('Exec Time', group_keys=False).apply(group_fill)
             df_history['group_id'] = df_history.groupby(['Exec Time', 'Symbol']).ngroup()
             
             for gid, group in df_history.groupby('group_id'):
-                
-                # 1. METADATA
                 group_gross_total = 0.0
                 trade_dt_obj = None
                 trade_symbol = None
                 leg_amounts = []
-                
                 for index, trade in group.iterrows():
                     raw_datetime = str(trade.get('Exec Time', ''))
                     if ' ' in raw_datetime and trade_dt_obj is None:
                         try: trade_dt_obj = pd.to_datetime(raw_datetime.split(' ')[0])
                         except: pass
-                    
                     trade_symbol = clean_text(trade.get('Symbol'))
                     qty_val = clean_currency(trade.get('Qty'))
                     price_val = clean_currency(trade.get('Price'))
                     exp_val = clean_text(trade.get('Exp') or trade.get('EXP'))
                     spread_val = clean_text(trade.get('Spread') or trade.get('SPREAD'))
-                    
                     spread_check = str(spread_val).strip().upper()
                     is_stock_spread = spread_val and spread_check in ['STOCK', 'FUND']
                     is_option = (exp_val is not None) or (spread_val is not None and not is_stock_spread)
                     multiplier = 100 if is_option else 1
-                    
                     leg_amt = -(qty_val * price_val * multiplier)
                     leg_amounts.append(leg_amt)
                     group_gross_total += leg_amt
 
-                # 2. TIER 1: CLUSTER MATCH
                 cluster_matched = False
-                cluster_fees = 0.0
-                cluster_comm = 0.0
-                cluster_desc = None
-                
+                cluster_fees, cluster_comm, cluster_desc = 0.0, 0.0, None
                 if not df_cash.empty and trade_symbol and trade_dt_obj and desc_col:
                     safe_symbol = re.escape(str(trade_symbol))
                     start_date = trade_dt_obj
                     end_date = trade_dt_obj + timedelta(days=5) 
-                    
                     candidates = df_cash[
-                        (df_cash['dt_obj'] >= start_date) & 
-                        (df_cash['dt_obj'] <= end_date) &
+                        (df_cash['dt_obj'] >= start_date) & (df_cash['dt_obj'] <= end_date) &
                         (~df_cash['is_matched']) &
                         (df_cash[desc_col].astype(str).str.contains(rf'\b{safe_symbol}\b', regex=True, na=False))
                     ]
-                    
                     if candidates.empty:
                         candidates = df_cash[
-                            (df_cash['dt_obj'] >= start_date) & 
-                            (df_cash['dt_obj'] <= end_date) &
+                            (df_cash['dt_obj'] >= start_date) & (df_cash['dt_obj'] <= end_date) &
                             (~df_cash['is_matched']) &
                             (df_cash[desc_col].astype(str).str.contains(str(trade_symbol), regex=False, na=False))
                         ]
-                    
                     if not candidates.empty:
                         candidates_cluster = candidates.copy()
                         candidates_cluster['diff'] = (candidates_cluster['clean_amount'] - group_gross_total).abs()
                         candidates_cluster = candidates_cluster.sort_values('diff')
-                        
                         if candidates_cluster.iloc[0]['diff'] < 20.0:
                             best_idx = candidates_cluster.iloc[0]['match_id']
                             match_row = df_cash.loc[best_idx]
-                            
                             misc_col = 'Misc Fees' if 'Misc Fees' in df_cash.columns else 'MISC FEES'
                             comm_col = 'Commissions & Fees' if 'Commissions & Fees' in df_cash.columns else 'COMMISSIONS & FEES'
-                            
                             cluster_fees = clean_currency(match_row.get(misc_col, 0))
                             cluster_comm = clean_currency(match_row.get(comm_col, 0))
                             cluster_desc = clean_text(match_row.get(desc_col))
-                            
                             df_cash.loc[best_idx, 'is_matched'] = True
                             cluster_matched = True
 
-                # 3. GENERATE RECORDS
                 for i, (index, trade) in enumerate(group.iterrows()):
                     raw_datetime = str(trade.get('Exec Time', ''))
                     trade_date_str, trade_time_str = None, "00:00:00"
@@ -342,38 +399,29 @@ def parse_file(uploaded_file):
 
                     gross_leg_amount = leg_amounts[i]
                     row_fees, row_comm, row_desc = 0.0, 0.0, None
-                    is_matched = False
-                    match_diff = 0.0
+                    is_matched, match_diff = False, 0.0
 
                     if cluster_matched:
                         is_matched = True
-                        if i == 0:
-                            row_fees, row_comm, row_desc = cluster_fees, cluster_comm, cluster_desc
-                        else:
-                            row_desc = cluster_desc + " (Spread Part)"
+                        if i == 0: row_fees, row_comm, row_desc = cluster_fees, cluster_comm, cluster_desc
+                        else: row_desc = cluster_desc + " (Spread Part)"
                     else:
                         if not candidates.empty:
                             live_candidates = df_cash.loc[candidates.index]
                             live_candidates = live_candidates[~live_candidates['is_matched']]
-                            
                             if not live_candidates.empty:
                                 live_candidates = live_candidates.copy()
                                 live_candidates['diff'] = (live_candidates['clean_amount'] - gross_leg_amount).abs()
                                 live_candidates = live_candidates.sort_values('diff')
-                                
                                 best_diff = live_candidates.iloc[0]['diff']
-                                
                                 if best_diff < 5.0:
                                     best_idx = live_candidates.iloc[0]['match_id']
                                     match_row = df_cash.loc[best_idx]
-                                    
                                     misc_col = 'Misc Fees' if 'Misc Fees' in df_cash.columns else 'MISC FEES'
                                     comm_col = 'Commissions & Fees' if 'Commissions & Fees' in df_cash.columns else 'COMMISSIONS & FEES'
-                                    
                                     row_fees = clean_currency(match_row.get(misc_col, 0))
                                     row_comm = clean_currency(match_row.get(comm_col, 0))
                                     row_desc = clean_text(match_row.get(desc_col))
-                                    
                                     df_cash.loc[best_idx, 'is_matched'] = True
                                     is_matched = True
                                     match_diff = best_diff
@@ -381,11 +429,9 @@ def parse_file(uploaded_file):
                     manual_review = False
                     review_reason = None
                     if not is_matched:
-                        manual_review = True
-                        review_reason = "No Cash Match Found"
+                        manual_review, review_reason = True, "No Cash Match Found"
                     elif match_diff > 5.0 and not cluster_matched:
-                        manual_review = True
-                        review_reason = f"Math Mismatch: Diff ${match_diff:.2f}"
+                        manual_review, review_reason = True, f"Math Mismatch: Diff ${match_diff:.2f}"
 
                     qty_val = clean_currency(trade.get('Qty'))
                     price_val = clean_currency(trade.get('Price'))

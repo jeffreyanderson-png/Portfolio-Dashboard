@@ -1,14 +1,17 @@
 import streamlit as st
 import pandas as pd
 #from datetime import datetime
+import sys
 import os
 #import hashlib
 #import time
 #import re
 from sqlmodel import SQLModel, create_engine, Session
 
-# --- SETUP: Make sure we can find the 'src' folder ---
-#import sys
+
+
+# --- SETUP: Make sure we can find the 'src' folder --- 
+#import sys 
 #sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 # --- LOCAL IMPORTS ---
@@ -16,23 +19,25 @@ import src.dbfunctions as dbfunctions
 import src.import_tos_csv as import_tos_csv
 from src.models import Transaction, AccountSnapshot
 from src import seed_data
-from src.dbfunctions import create_engine_func # Ensure you have this import
-
-# --- CONFIGURATION ---
-st.set_page_config(
-    page_title="Pilot Portfolio Manager v2.1",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+from src.dbfunctions import create_engine_func # Ensure you have this import 
 
 # --- CONSTANTS ---
 DB_FOLDER = "data"
 DB_FILE = "portfolio.db"
 DB_PATH = os.path.join(DB_FOLDER, DB_FILE)
-# SQLModel needs a URL format for the engine (sqlite:///path/to/db) 
+# SQLModel needs a URL format for the engine (sqlite:///path/to/db)
 DB_URL = f"sqlite:///{DB_PATH}"
+VER_STR = "2.3"
 
-# --- INITIALIZATION ---
+# --- CONFIGURATION ---
+st.set_page_config(
+    page_title="Pilot Portfolio Manager v" + VER_STR,
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# --- INITIALIZATION --- 
+@st.cache_resource # <--- THIS STOPS THE RE-RUNS
 def init_db():
     """Checks if DB exists, creates folder if needed."""
     if not os.path.exists(DB_FOLDER):
@@ -43,36 +48,38 @@ def init_db():
 
     # 1. Create Tables (Idempotent - won't break if they exist)
     SQLModel.metadata.create_all(engine)
-
+    
     # 2. Seed Data (Now safe to run because tables exist)
     seed_data.seed_strategies(DB_URL)
-
+    
     return engine
 
 # --- MAIN APP LOGIC ---
 def main():
-    st.title("✈️ Pilot Portfolio Manager v2.1")
+    st.title("✈️ Pilot Portfolio Manager v" + VER_STR)
     # Ensure DB tables exist before we do anything else 
     init_db()
     
     # Sidebar for Navigation
-    page = st.sidebar.selectbox("Go to", ["Dashboard", "Import Data", "Data Inspector", "Settings"])
+    #page = st.sidebar.selectbox("Go to", ["Dashboard", "Import Data", "Data Inspector", "Settings"])
+    page = st.sidebar.selectbox("Go to", ["Import Data", "Data Inspector", "Settings"])
 
-    if page == "Dashboard":
-        st.write("### Welcome Back")
-        st.info("Database not yet connected. Go to 'Import Data' to start.")
+    #if page == "Dashboard":
+    #    st.write("### Welcome Back")
+    #    st.info("Database not yet connected. Go to 'Import Data' to start.")
         
-    elif page == "Import Data":
+    #elif page == "Import Data":
+    if page == "Import Data":
         st.header("Import ThinkOrSwim CSV")
         
         # 1. Create the uploader
         uploaded_file = st.file_uploader("Upload Account Statement", type=['csv'])
         
-        # 2. Check if a file was actually uploaded
+        # 2. Check if a file was actually uploaded 
         if uploaded_file is not None:
             st.write(f"Filename: `{uploaded_file.name}`")
             
-            # 3. Create the button INSIDE the file check block
+            # 3. Create the button INSIDE the file check block 
             if st.button("Process File"):
                 
                 with st.spinner("Parsing file..."):

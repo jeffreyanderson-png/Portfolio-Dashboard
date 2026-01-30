@@ -4,44 +4,36 @@ from datetime import date, time, datetime
 
 # --- 1. CONFIGURATION TABLES ---
 class Strategy(SQLModel, table=True):
-    """Defines the high-level strategy types (e.g., 'The Wheel', 'Calendar Spread')"""
     __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = Field(unique=True, index=True) 
     description: Optional[str] = None
     
-    # Back-populates
-    campaigns: List["Campaign"] = Relationship(back_populates="strategy")
-    symbol_defaults: List["SymbolSettings"] = Relationship(back_populates="default_strategy")
+    # REMOVED: campaigns, symbol_defaults (Breaks circular dependency)
 
 class SymbolSettings(SQLModel, table=True):
-    """Stores user defaults for specific symbols"""
     __table_args__ = {"extend_existing": True}
-    symbol: str = Field(primary_key=True) # "GOOG", "ASTS"
+    symbol: str = Field(primary_key=True)
     
-    # Default Strategy for this symbol
     default_strategy_id: Optional[int] = Field(default=None, foreign_key="strategy.id")
-    default_strategy: Optional[Strategy] = Relationship(back_populates="symbol_defaults")
-    notes: Optional[str] = None # General notes on the ticker
+    # SAFE: 'Strategy' is defined above, so we use the Class directly (No quotes)
+    default_strategy: Optional[Strategy] = Relationship()
+    notes: Optional[str] = None
 
 # --- 2. CAMPAIGN MANAGEMENT ---
 class Campaign(SQLModel, table=True):
-    """A specific instance of a strategy (e.g., 'GOOG Wheel Jan 2026')"""
-    __table_args__ = {"extend_existing": True}
     __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str 
-    symbol: str # The primary ticker this campaign focuses on
+    symbol: str 
     start_date: date = Field(default_factory=date.today)
-    status: str = Field(default="OPEN") # OPEN, CLOSED, ARCHIVED
+    status: str = Field(default="OPEN") 
     
-    # Link to the Strategy Definition
     strategy_id: Optional[int] = Field(default=None, foreign_key="strategy.id")
-    strategy: Optional[Strategy] = Relationship(back_populates="campaigns")
+    # SAFE: 'Strategy' is defined above
+    strategy: Optional[Strategy] = Relationship()
     
-    # Data Links
-    notes: List["Note"] = Relationship(back_populates="campaign")
-    transactions: List["Transaction"] = Relationship(back_populates="campaign")
+    # REMOVED: notes, transactions
 
 class Note(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
@@ -50,7 +42,8 @@ class Note(SQLModel, table=True):
     content: str
     
     campaign_id: Optional[int] = Field(default=None, foreign_key="campaign.id")
-    campaign: Optional[Campaign] = Relationship(back_populates="notes")
+    # SAFE: 'Campaign' is defined above
+    campaign: Optional[Campaign] = Relationship()
 
 # --- 3. CORE DATA ---
 class Transaction(SQLModel, table=True):
@@ -83,7 +76,8 @@ class Transaction(SQLModel, table=True):
     review_reason: Optional[str] = None
     
     campaign_id: Optional[int] = Field(default=None, foreign_key="campaign.id")
-    campaign: Optional[Campaign] = Relationship(back_populates="transactions")
+    # SAFE: 'Campaign' is defined above
+    campaign: Optional[Campaign] = Relationship()
 
 class AccountSnapshot(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
@@ -93,13 +87,15 @@ class AccountSnapshot(SQLModel, table=True):
     net_liquidating_value: Optional[float] = None 
     is_net_liq_valid: bool = Field(default=False) 
     row_hash: str = Field(unique=True, index=True)
-    positions: List["PositionSnapshot"] = Relationship(back_populates="snapshot")
+    
+    # REMOVED: positions
 
 class PositionSnapshot(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     snapshot_id: Optional[int] = Field(default=None, foreign_key="accountsnapshot.id")
-    snapshot: Optional[AccountSnapshot] = Relationship(back_populates="positions")
+    # SAFE: 'AccountSnapshot' is defined above
+    snapshot: Optional[AccountSnapshot] = Relationship()
     
     symbol: str
     description: Optional[str] = None
@@ -111,8 +107,7 @@ class PositionSnapshot(SQLModel, table=True):
     strike: Optional[float] = None
     option_type: Optional[str] = None
     
-    # --- NEW FIELDS FROM CSV ---
     option_code: Optional[str] = None
-    trade_price: Optional[float] = None # Cost basis
+    trade_price: Optional[float] = None
     pl_open: Optional[float] = None
     pl_pct: Optional[float] = None
