@@ -1,12 +1,11 @@
 import streamlit as st
 import pandas as pd
-import os 
-from sqlmodel import Session, select, func
+import os
 from datetime import date, timedelta
-from src.models import AccountSnapshot, PositionSnapshot, Transaction
+from sqlmodel import Session, select, func, col
+from src.models import Transaction, AccountSnapshot, PositionSnapshot
 from src.dbfunctions import create_engine_func
 
-# --- SETUP ---
 st.set_page_config(page_title="Dashboard", layout="wide")
 
 @st.cache_resource
@@ -17,151 +16,149 @@ def get_db_engine():
 
 engine = get_db_engine()
 
-st.title("🚀 Options Command Center")
+st.title("🚀 Portfolio Dashboard")
 
-# --- SECTION 1: HIGH LEVEL METRICS ---
+# --- HELPER: DATES ---
+today = date.today()
+start_of_year = date(today.year, 1, 1)
+d30_start = today - timedelta(days=30)
+d60_start = today - timedelta(days=60)
+
+# --- SECTION 1: PREMIUM ENGINE (Income) ---
+st.header("💸 Premium Income (Net)")
+
 with Session(engine) as session:
-    latest_snap = session.exec(
-        select(AccountSnapshot).order_by(AccountSnapshot.snapshot_date.desc())
-    ).first()
+    # 1. FETCH OPTION TRANSACTIONS
+    # STRICT FILTER: Must be explicitly CALL or PUT.
+    # We also keep the +/- 5000 limit to catch any accidental large assignments.
     
-    if not latest_snap:
-        st.error("No data found. Please import a file on the Home page.")
-        st.stop()
+    def get_premium_sum(start_date, end_date=None):
+        query = select(func.sum(Transaction.cb_amount)).where(
+            col(Transaction.option_type).in_(["CALL", "PUT", "Call", "Put"]), # Handle case sensitivity
+            Transaction.exec_date >= start_date,
+            Transaction.cb_amount.between(-5000, 5000) 
+        )
+        if end_date:
+            query = query.where(Transaction.exec_date < end_date)
         
-    today = date.today()
-    ytd_start = date(today.year, 1, 1)
-    d30_start = today - timedelta(days=30)
-    d7_start = today - timedelta(days=7)
-    
-    def get_pl(start_date):
-        query = select(func.sum(Transaction.cb_amount)).where(Transaction.exec_date >= start_date)
         result = session.exec(query).first()
         return result if result else 0.0
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    ytd_premium = get_premium_sum(start_of_year)
+    last_30_premium = get_premium_sum(d30_start)
+    prior_30_premium = get_premium_sum(d60_start, d30_start)
     
-    nlv_label = "Net Liquidating Value"
-    if not latest_snap.is_net_liq_valid: nlv_label += " (Est.)"
-        
-    col1.metric(nlv_label, f"${latest_snap.net_liquidating_value:,.2f}")
-    col2.metric("Cash Balance", f"${latest_snap.total_cash_balance:,.2f}")
-    col3.metric("YTD Realized P/L", f"${get_pl(ytd_start):,.2f}")
-    col4.metric("30-Day Realized", f"${get_pl(d30_start):,.2f}")
-    col5.metric("7-Day Realized", f"${get_pl(d7_start):,.2f}")
+    delta_30 = last_30_premium - prior_30_premium
 
-    st.markdown("---")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("YTD Option Income", f"${ytd_premium:,.2f}")
+    c2.metric("Last 30 Days", f"${last_30_premium:,.2f}", delta=f"{delta_30:,.2f} vs Prior")
+    c3.metric("Prior 30 Days", f"${prior_30_premium:,.2f}")
 
-    # --- SECTION 2: RISK & ALLOCATION ---
-    positions = session.exec(
-        select(PositionSnapshot).where(PositionSnapshot.snapshot_id == latest_snap.id)
-    ).all()
+    # --- DEBUG / AUDIT TOOL ---
+    with st.expander("🕵️ Audit: Premium Log (Last 30 Days)"):
+        st.caption("Transactions counted as 'Premium' (Filtered for CALL/PUT only):")
+        audit_trades = session.exec(
+            select(Transaction)
+            .where(Transaction.exec_date >= d30_start)
+            .where(col(Transaction.option_type).in_(["CALL", "PUT", "Call", "Put"]))
+            .where(Transaction.cb_amount.between(-5000, 5000))
+            .order_by(Transaction.cb_amount.desc())
+            .limit(20)
+        ).all()
+        if audit_trades:
+            st.dataframe(pd.DataFrame([t.model_dump() for t in audit_trades])[
+                ['exec_date', 'symbol', 'option_type', 'side', 'cb_amount', 'cb_description']
+            ])
+
+    st.divider()
+
+    # --- SECTION 2: CAPITAL & RISK ---
+    st.header("🛡️ Capital & Risk")
     
-    if positions:
-        # Load Data
-        df_pos = pd.DataFrame([p.model_dump() for p in positions])
+    latest_snap = session.exec(select(AccountSnapshot).order_by(AccountSnapshot.snapshot_date.desc())).first()
+    
+    if not latest_snap:
+        st.warning("No data found.")
+        st.stop()
         
-        # FIX 1: FILTER JUNK ROWS
-        if 'symbol' in df_pos.columns:
-            df_pos = df_pos[~df_pos['symbol'].astype(str).str.contains("TOTAL", case=False, na=False)]
-
-        # FIX 2: FORCE NUMERIC TYPES (Prevents "Object" errors)
-        cols_to_numeric = ['qty', 'mark_price', 'market_value', 'strike']
-        for col in cols_to_numeric:
-            if col in df_pos.columns:
-                df_pos[col] = pd.to_numeric(df_pos[col], errors='coerce').fillna(0.0)
-
-        # FIX 3: CONVERT DATES TO DATETIME (Prevents ArrowInvalid Error)
-        # Streamlit hates datetime.date objects mixed with None. It wants datetime64.
-        date_cols = ['exp_date']
-        for col in date_cols:
-            if col in df_pos.columns:
-                df_pos[col] = pd.to_datetime(df_pos[col], errors='coerce')
-
-        if 'exp_date' in df_pos.columns:
-            df_options = df_pos[df_pos['asset_type'] == 'OPTION'].copy()
+    positions = session.exec(select(PositionSnapshot).where(PositionSnapshot.snapshot_id == latest_snap.id)).all()
+    
+    csp_collateral = 0.0
+    stock_value = 0.0
+    put_risk_total = 0.0
+    
+    # 3. ACTION TABLE LOGIC
+    action_items = []
+    
+    for p in positions:
+        # Capital Math
+        if p.asset_type == 'STOCK':
+            stock_value += (p.market_value or 0.0)
+        elif p.asset_type == 'OPTION':
+            otype = p.option_type or "Unknown"
             
-            # --- 🔍 TEXT-ONLY DEBUGGER (Safe to run) ---
-            with st.expander("🔍 Diagnostic Report", expanded=True):
-                st.write(f"Total Option Rows: {len(df_options)}")
-                if not df_options.empty:
-                    st.write(f"Unique Asset Types: {df_pos['asset_type'].unique()}")
-                    st.write(f"Total Market Value (Sum): {df_options['market_value'].sum()}")
-                    st.write("First 3 Market Values (Raw):", df_options['market_value'].head(3).tolist())
-                    
-                    # Check Buckets
-                    snap_date_ts = pd.to_datetime(latest_snap.snapshot_date)
-                    df_options['dte'] = (pd.to_datetime(df_options['exp_date']) - snap_date_ts).dt.days
-                    st.write("DTE Stats:", df_options['dte'].describe())
-            # ------------------------------------------
+            # Risk Math (Only Short Puts)
+            if otype == 'PUT' and p.qty < 0:
+                risk = (p.strike or 0) * 100 * abs(p.qty)
+                csp_collateral += risk
+                put_risk_total += risk
+
+            # --- ACTION SCANNER ---
+            reasons = []
             
-            if not df_options.empty:
-                # Normalize Dates
-                snap_date_ts = pd.to_datetime(latest_snap.snapshot_date)
-                
-                # DTE Calculation
-                df_options['dte'] = (df_options['exp_date'] - snap_date_ts).dt.days
-                df_options['dte'] = df_options['dte'].fillna(0) # Handle NaNs
-                
-                # Bucketing
-                def bucket_dte(d):
-                    if d < 30: return "< 30 Days"
-                    elif d <= 180: return "30-180 Days"
-                    return "> 180 Days"
-                
-                df_options['bucket'] = df_options['dte'].apply(bucket_dte)
-                
-                # Chart Data
-                chart_data = df_options.groupby(['bucket', 'option_type'])['market_value'].sum().unstack().fillna(0)
-                
-                # Cash Secured Put Risk
-                df_csp = df_options[(df_options['option_type'] == 'PUT') & (df_options['qty'] < 0)].copy()
-                total_risk = (df_csp['strike'] * df_csp['qty'].abs() * 100).sum() if not df_csp.empty else 0
-                risk_near = df_csp[(df_csp['dte'] >= 15) & (df_csp['dte'] <= 30)]['strike'].sum() * 100 if not df_csp.empty else 0
+            # Condition 1: Expiring Soon (< 7 Days)
+            dte = 999
+            if p.exp_date:
+                dte = (pd.to_datetime(p.exp_date).date() - today).days
+                if dte < 7: reasons.append(f"⏳ Expiring ({dte}d)")
+            
+            # Condition 2: Near Strike (10% or $0.50)
+            if p.strike:
+                mark = p.mark_price or 0
+                dist = abs(mark - p.strike)
+                # Logic: If Mark is close to Strike
+                # Note: For Short Puts, "Close" means Price is dropping to Strike
+                # For Short Calls, "Close" means Price is rising to Strike
+                # We simplified to absolute distance here
+                threshold = max(0.50, p.strike * 0.10)
+                if dist <= threshold:
+                    reasons.append("🎯 Near Strike")
 
-                c1, c2 = st.columns([2, 1])
-                with c1:
-                    st.subheader("Option Exposure")
-                    if not chart_data.empty:
-                        st.bar_chart(chart_data)
-                    else:
-                        st.info("No option market value data found.")
-                with c2:
-                    st.subheader("Put Assignment Risk")
-                    st.metric("Total", f"${total_risk:,.0f}")
-                    st.metric("15-30 Days", f"${risk_near:,.0f}")
+            # Condition 3: Cheap Buyback (Mark < $0.10) for Short Positions
+            if p.qty < 0 and (p.mark_price or 0) < 0.10:
+                reasons.append("💰 Cheap Buyback")
+            
+            if reasons:
+                action_items.append({
+                    "Symbol": p.symbol,
+                    "Qty": int(p.qty),
+                    "Type": f"{otype} {p.strike}",
+                    "Exp": p.exp_date,
+                    "Mark": p.mark_price,
+                    "Action Needed": ", ".join(reasons)
+                })
 
-    st.markdown("---")
-
-    # --- SECTION 3: ATTENTION LIST ---
-    st.subheader("⚠️ Attention Needed")
+    # Capital Display
+    col_cap1, col_cap2, col_cap3 = st.columns(3)
+    col_cap1.metric("Stock Holdings", f"${stock_value:,.2f}")
+    col_cap2.metric("Cash Securing Puts", f"${csp_collateral:,.2f}")
+    col_cap3.metric("Total Put Risk", f"${put_risk_total:,.0f}")
     
-    if positions and 'df_options' in locals() and not df_options.empty:
-        near_exp = df_options[df_options['dte'] < 14].copy()
-        
-        # Strike Distance Logic
-        df_options['strike_dist_pct'] = 999.0
-        mask_nonzero = df_options['strike'] > 0
-        
-        if mask_nonzero.any():
-            df_options.loc[mask_nonzero, 'strike_dist_pct'] = (
-                (df_options.loc[mask_nonzero, 'mark_price'] - df_options.loc[mask_nonzero, 'strike']).abs() 
-                / df_options.loc[mask_nonzero, 'strike']
-            ) * 100
-        
-        near_strike = df_options[df_options['strike_dist_pct'] < 10.0].copy()
-        
-        tab1, tab2 = st.tabs(["Expiring Soon (<14d)", "Close to Strike (<10%)"])
-        
-        with tab1:
-            if not near_exp.empty:
-                # FIX 4: Use width='stretch' instead of deprecated use_container_width
-                st.dataframe(near_exp[['symbol', 'description', 'qty', 'dte', 'market_value']], width='stretch')
-            else:
-                st.info("No options expiring in the next 14 days.")
-                
-        with tab2:
-            if not near_strike.empty:
-                st.dataframe(near_strike[['symbol', 'description', 'qty', 'mark_price', 'strike', 'strike_dist_pct']], width='stretch')
-            else:
-                st.info("No options currently within 10% of strike price.")
+    st.divider()
+
+    # --- SECTION 3: ACTION TABLE ---
+    st.subheader("⚡ Action Needed")
+    if action_items:
+        df_action = pd.DataFrame(action_items)
+        st.dataframe(
+            df_action,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Mark": st.column_config.NumberColumn(format="$%.2f"),
+                "Exp": st.column_config.DateColumn(format="MM/DD")
+            }
+        )
+    else:
+        st.success("No urgent actions found. Portfolio is cruising! 🚢")
