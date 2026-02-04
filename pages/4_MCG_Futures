@@ -1,0 +1,71 @@
+import streamlit as st
+import pandas as pd
+import pandas_ta_classic as ta
+from streamlit_autorefresh import st_autorefresh
+
+# 1. SET UP THE AUTOREFRESH (60,000 ms = 1 minute)
+# This will rerun the entire script automatically on this interval.
+count = st_autorefresh(interval=60000, key="mgc_refresh")
+
+st.title("Live /MGC Retest Tracker")
+st.write(f"Last update count: {count}")
+
+# 2. DATA ACQUISITION
+# Replace this with your actual API call (e.g., yfinance for 'GC=F' or IBKR)
+def get_latest_data():
+    # Example placeholder: df = your_api.get_bars("/MGC", limit=100)
+    # Ensure your columns are named: 'open', 'high', 'low', 'close', 'volume'
+    return pd.read_csv("mgc_data.csv") 
+
+df = get_latest_data()
+
+# 3. APPEND INDICATORS DIRECTLY
+# 'append=True' automatically adds 'RSI_14' as a new column to your 'df'
+df.ta.rsi(length=14, append=True)
+
+# 4. MONITOR THE RETEST
+latest_rsi = df['RSI_14'].iloc[-1]
+st.metric("Current RSI", f"{latest_rsi:.2f}")
+
+# Your logic for the 'retest' alert
+if 40 <= latest_rsi <= 45:
+    st.warning("⚠️ /MGC is in the Retest Zone (RSI 40-45)")
+
+def calculate_rsi(df, period=14):
+    # Uses the standard Wilder's RSI calculation
+    df['RSI'] = ta.rsi(df['close'], length=period)
+    return df
+
+def check_retest_condition(df, overbought=70, oversold=30):
+    """
+    Logic: Triggers an alert if the RSI was recently oversold 
+    and is now performing a 'retest' of a specific level.
+    """
+    latest_rsi = df['RSI'].iloc[-1]
+    prev_rsi = df['RSI'].iloc[-2]
+    
+    # Example 'Retest' Logic: RSI was below 30, rose, and is now 
+    # stabilizing/dipping back toward a 40-45 level before a move higher.
+    if 40 <= latest_rsi <= 48 and prev_rsi > latest_rsi:
+        return True, latest_rsi
+    return False, latest_rsi
+
+# --- Streamlit UI ---
+st.title("Gold Futures (/MGC) Scalp Alert")
+
+# Mock data load - Replace with your live API feed (e.g., yfinance or TwelveData)
+# df = get_live_mgc_data() 
+
+if 'df' in locals():
+    df = calculate_rsi(df)
+    alert_triggered, rsi_val = check_retest_condition(df)
+
+    if alert_triggered:
+        st.error(f"🚨 RETEST ALERT: /MGC RSI at {rsi_val:.2f}")
+        # Optional: Add an audio ping using HTML
+        st.components.v1.html(
+            """<audio autoplay><source src="https://www.soundjay.com/buttons/beep-01a.mp3" type="audio/mpeg"></audio>""",
+            height=0,
+        )
+    else:
+        st.success(f"Monitoring... Current RSI: {rsi_val:.2f}")

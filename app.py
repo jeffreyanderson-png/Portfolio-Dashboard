@@ -8,8 +8,6 @@ import os
 #import re
 from sqlmodel import SQLModel, create_engine, Session
 
-
-
 # --- SETUP: Make sure we can find the 'src' folder --- 
 #import sys 
 #sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))

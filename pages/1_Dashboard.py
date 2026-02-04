@@ -6,6 +6,8 @@ from sqlmodel import Session, select, func, col
 from src.models import Transaction, AccountSnapshot, PositionSnapshot
 from src.dbfunctions import create_engine_func
 
+import pandas_ta_classic as ta  # Efficient technical analysis library
+
 st.set_page_config(page_title="Dashboard", layout="wide")
 
 @st.cache_resource
@@ -162,3 +164,44 @@ with Session(engine) as session:
         )
     else:
         st.success("No urgent actions found. Portfolio is cruising! 🚢")
+
+       
+
+def calculate_rsi(df, period=14):
+    # Uses the standard Wilder's RSI calculation
+    df['RSI'] = ta.rsi(df['close'], length=period)
+    return df
+
+def check_retest_condition(df, overbought=70, oversold=30):
+    """
+    Logic: Triggers an alert if the RSI was recently oversold 
+    and is now performing a 'retest' of a specific level.
+    """
+    latest_rsi = df['RSI'].iloc[-1]
+    prev_rsi = df['RSI'].iloc[-2]
+    
+    # Example 'Retest' Logic: RSI was below 30, rose, and is now 
+    # stabilizing/dipping back toward a 40-45 level before a move higher.
+    if 40 <= latest_rsi <= 48 and prev_rsi > latest_rsi:
+        return True, latest_rsi
+    return False, latest_rsi
+
+# --- Streamlit UI ---
+st.title("Gold Futures (/MGC) Scalp Alert")
+
+# Mock data load - Replace with your live API feed (e.g., yfinance or TwelveData)
+# df = get_live_mgc_data() 
+
+if 'df' in locals():
+    df = calculate_rsi(df)
+    alert_triggered, rsi_val = check_retest_condition(df)
+
+    if alert_triggered:
+        st.error(f"🚨 RETEST ALERT: /MGC RSI at {rsi_val:.2f}")
+        # Optional: Add an audio ping using HTML
+        st.components.v1.html(
+            """<audio autoplay><source src="https://www.soundjay.com/buttons/beep-01a.mp3" type="audio/mpeg"></audio>""",
+            height=0,
+        )
+    else:
+        st.success(f"Monitoring... Current RSI: {rsi_val:.2f}")
