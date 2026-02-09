@@ -3,7 +3,7 @@ import pandas as pd
 import pandas_ta_classic as ta
 from streamlit_autorefresh import st_autorefresh
 
-# 1. SET UP THE AUTOREFRESH (60,000 ms = 1 minute)
+# 1. SET UP THE AUTOREFRESH (60,000 ms = 1 minute) 
 # This will rerun the entire script automatically on this interval.
 count = st_autorefresh(interval=60000, key="mgc_refresh")
 
