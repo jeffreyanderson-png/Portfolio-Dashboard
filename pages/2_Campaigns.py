@@ -183,12 +183,33 @@ with tab_assembler:
             
             st.divider()
             
-            # 4. ACTION MODE (The New Feature!)
-            mode = st.radio("Action", ["Add to Existing Campaign", "Create New Campaign"], horizontal=True)
-            
+            # 4. ACTION TABS
             selected_ids = edited_df[edited_df["Select"] == True]["id"].tolist()
             
-            if mode == "Create New Campaign":
+            tab_existing, tab_new = st.tabs(["➕ Add to Existing Campaign", "🚀 Create New Campaign"])
+            
+            # --- SUB-TAB: ADD TO EXISTING ---
+            with tab_existing:
+                exist_camps = session.exec(select(Campaign).where(Campaign.symbol == selected_symbol)).all()
+                
+                if not exist_camps:
+                    st.warning(f"No existing campaigns found for {selected_symbol}. Create one in the next tab.")
+                else:
+                    camp_map = {f"{c.name} ({c.status})": c.id for c in exist_camps}
+                    target_camp_name = st.selectbox("Select Target Campaign", list(camp_map.keys()), key="target_select")
+                    target_camp_id = camp_map[target_camp_name]
+                    
+                    if st.button("➕ Append Selected Trades", type="primary", disabled=len(selected_ids)==0, key="btn_append"):
+                        trades = session.exec(select(Transaction).where(Transaction.id.in_(selected_ids))).all()
+                        for t in trades:
+                            t.campaign_id = target_camp_id
+                            session.add(t)
+                        session.commit()
+                        st.success(f"Added {len(trades)} trades to campaign!")
+                        st.rerun()
+
+            # --- SUB-TAB: CREATE NEW ---
+            with tab_new:
                 c_form1, c_form2 = st.columns(2)
                 with c_form1:
                     new_camp_name = st.text_input("Name", value=f"{selected_symbol} Wheel")
@@ -196,9 +217,9 @@ with tab_assembler:
                     strategies = session.exec(select(Strategy)).all()
                     strat_map = {s.name: s.id for s in strategies}
                     def_idx = list(strat_map.keys()).index("The Wheel") if "The Wheel" in strat_map else 0
-                    selected_strat = st.selectbox("Strategy", list(strat_map.keys()), index=def_idx)
+                    selected_strat = st.selectbox("Strategy", list(strat_map.keys()), index=def_idx, key="strat_select")
                 
-                if st.button("🚀 Create & Assign", type="primary", disabled=len(selected_ids)==0):
+                if st.button("🚀 Create & Assign Selected Trades", type="primary", disabled=len(selected_ids)==0, key="btn_create"):
                     new_campaign = Campaign(name=new_camp_name, symbol=selected_symbol, strategy_id=strat_map[selected_strat], status="OPEN")
                     session.add(new_campaign)
                     session.commit()
@@ -211,23 +232,3 @@ with tab_assembler:
                     session.commit()
                     st.success(f"Created '{new_camp_name}'!")
                     st.rerun()
-
-            else: # ADD TO EXISTING
-                # Fetch existing campaigns for this symbol
-                exist_camps = session.exec(select(Campaign).where(Campaign.symbol == selected_symbol)).all()
-                
-                if not exist_camps:
-                    st.warning(f"No existing campaigns found for {selected_symbol}. Create one first.")
-                else:
-                    camp_map = {f"{c.name} ({c.status})": c.id for c in exist_camps}
-                    target_camp_name = st.selectbox("Select Target Campaign", list(camp_map.keys()))
-                    target_camp_id = camp_map[target_camp_name]
-                    
-                    if st.button("➕ Append Trades", type="primary", disabled=len(selected_ids)==0):
-                        trades = session.exec(select(Transaction).where(Transaction.id.in_(selected_ids))).all()
-                        for t in trades:
-                            t.campaign_id = target_camp_id
-                            session.add(t)
-                        session.commit()
-                        st.success(f"Added {len(trades)} trades to campaign!")
-                        st.rerun()

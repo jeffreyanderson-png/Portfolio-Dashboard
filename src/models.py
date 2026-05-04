@@ -111,3 +111,8 @@ class PositionSnapshot(SQLModel, table=True):
     trade_price: Optional[float] = None
     pl_open: Optional[float] = None
     pl_pct: Optional[float] = None
+
+class RebalanceLog(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    rebalance_date: date
+    notes: Optional[str] = None

@@ -77,11 +77,20 @@ def analyze_wheel_stats(campaign, session):
     total_premiums = 0.0
     total_stock_cost = 0.0
     long_call_premium_paid = 0.0
+    
+    # NEW VARIABLES FOR RATIO
+    options_sold_qty = 0
+    gross_premium_collected = 0.0
 
     for t in trades:
         is_option = (t.option_type is not None)
         is_stock_trade = (not is_option)
         is_long_call_buy = (is_option and t.option_type == 'CALL' and t.qty > 0)
+        
+        # AGGREGATION: Track average premium on sold contracts (Positive cash flow)
+        if is_option and t.cb_amount > 0:
+            options_sold_qty += abs(t.qty)
+            gross_premium_collected += t.cb_amount
         
         if is_stock_trade and t.qty > 0:
             total_stock_cost += abs(t.cb_amount)
@@ -106,12 +115,17 @@ def analyze_wheel_stats(campaign, session):
     if open_cc_qty > 0: status_parts.append(f"-{int(open_cc_qty)} CC")
     status_str = " | ".join(status_parts) if status_parts else "Idle"
 
+    # AGGREGATION: Calculate the Premium to Share Ratio
+    avg_premium = (gross_premium_collected / options_sold_qty) / 100 if options_sold_qty > 0 else 0.0
+    share_accum_ratio = (avg_premium * 100) / current_price if current_price > 0 else 0.0
+
     return {
         "id": campaign.id,
         "Symbol": campaign.symbol,
         "Campaign": campaign.name,
         "Adj Cost Basis": acb,
         "Current Price": current_price,
+        "Premium-to-Share Ratio": round(share_accum_ratio, 2),
         "Net P/L": net_pl,
         "Status": status_str
     }
@@ -137,87 +151,29 @@ with Session(engine) as session:
     
     df_summary = pd.DataFrame(table_data)
     
-    col_list, col_deck = st.columns([2, 1])
-    
-    with col_list:
-        st.subheader("📋 Active Wheels")
-        st.dataframe(
-            df_summary.drop(columns=["id"]),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Adj Cost Basis": st.column_config.NumberColumn(format="$%.2f"),
-                "Current Price": st.column_config.NumberColumn(format="$%.2f"),
-                "Net P/L": st.column_config.NumberColumn(format="$%.2f"),
-            }
-        )
+    st.subheader("📋 Active Wheels")
 
-    with col_deck:
-        st.subheader("🛠️ Trade Deck")
-        camp_options = {c.name: c.id for c in campaigns}
-        
-        # UI TWEAK: Removed label, cleaner look
-        selected_camp_name = st.selectbox("Select Campaign", list(camp_options.keys()), label_visibility="collapsed")
-        
-        selected_camp_id = camp_options[selected_camp_name]
-        selected_camp = next(c for c in campaigns if c.id == selected_camp_id)
-        
-        with st.container(border=True):
-            with st.form("manual_entry_form"):
-                st.caption(f"Log Trade: **{selected_camp.symbol}**")
-                c1, c2 = st.columns(2)
-                entry_side = c1.selectbox("Side", ["SELL", "BUY"])
-                entry_qty = c1.number_input("Qty", min_value=1, value=1)
-                entry_type = c2.selectbox("Type", ["PUT", "CALL", "STOCK"])
-                entry_price = c2.number_input("Price", step=0.01, format="%.2f")
+    st.dataframe(
+        df_summary.drop(columns=["id"]), # Hides the ID column for cleaner UI
+        use_container_width=True,
+        hide_index=True
+    )
 
-                entry_strike = None
-                entry_exp = None
-                if entry_type != "STOCK":
-                    c3, c4 = st.columns(2)
-                    entry_strike = c3.number_input("Strike", step=0.5)
-                    entry_exp = c4.date_input("Expiration")
+    st.divider()
 
-                if st.form_submit_button("💾 Log Trade", type="primary"):
-                    multiplier = 100 if entry_type != "STOCK" else 1
-                    gross_amt = entry_price * entry_qty * multiplier
-                    cb_amount = gross_amt if entry_side == "SELL" else -gross_amt
-                    db_side = f"{entry_side}_OPEN"
-                    
-                    new_trade = Transaction(
-                        exec_date=date.today(),
-                        exec_time=datetime.now().time(),
-                        symbol=selected_camp.symbol,
-                        qty=entry_qty if entry_side == "BUY" else -entry_qty,
-                        price=entry_price,
-                        side=db_side,
-                        option_type=entry_type if entry_type != "STOCK" else None,
-                        strike=entry_strike,
-                        exp_date=entry_exp,
-                        cb_amount=cb_amount,
-                        cb_description="Manual Entry",
-                        transaction_type="TRADE",
-                        campaign_id=selected_camp.id,
-                        row_hash="TEMP"
-                    )
-                    
-                    trade_dict = new_trade.model_dump()
-                    trade_dict.pop('row_hash')
-                    new_trade.row_hash = generate_hash(trade_dict)
-                    
-                    try:
-                        session.add(new_trade)
-                        session.commit()
-                        st.success("Logged!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+    # 2. CAMPAIGN MANAGER
+    st.subheader("🛠️ Campaign Manager")
+    camp_options = {c.name: c.id for c in campaigns}
+    selected_camp_name = st.selectbox("Select Campaign", list(camp_options.keys()), label_visibility="collapsed")
+
+    selected_camp_id = camp_options[selected_camp_name]
+    selected_camp = next(c for c in campaigns if c.id == selected_camp_id)
 
     st.divider()
 
     # --- HISTORY SECTION ---
     if selected_camp:
-        st.subheader(f"📜 History: {selected_camp.name}")
+        st.subheader(f"📖 History: {selected_camp.name}")
         
         # 1. Get History
         hist_trades = session.exec(
@@ -251,7 +207,6 @@ with Session(engine) as session:
                 row = t.model_dump()
                 
                 # A. Calculate DTE (From TODAY)
-                # Only show if the date is in the future or today
                 row['DTE_Current'] = None
                 if t.exp_date:
                     try:
@@ -292,3 +247,4 @@ with Session(engine) as session:
             )
         else:
             st.info("No trade history for this campaign.")
+            
