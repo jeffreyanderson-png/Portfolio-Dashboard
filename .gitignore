@@ -6,3 +6,6 @@ launch.json
 .vscode/
 *.csv
 *.db
+.env
+data/aw_token.json
+data/af_token.json
