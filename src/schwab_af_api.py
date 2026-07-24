@@ -10,11 +10,15 @@ load_dotenv(env_path)
 
 AF_APP_KEY = os.getenv("SCHWAB_AF_APP_KEY")
 AF_APP_SECRET = os.getenv("SCHWAB_AF_APP_SECRET")
-REDIRECT_URI = "https://127.0.0.1" 
+REDIRECT_URI = "https://127.0.0.1:8080" 
 TOKEN_FILE = os.path.join("data", "af_token.json")
 
 if not AF_APP_KEY:
-    raise ValueError("ERROR: AlpineFire App Key not found. Check your .env file.")
+    print("WARNING: Alpine Fire App Key not found. Check your .env file.")
+
+def get_auth_url():
+    """Step 1: Generates the login link for manual authentication."""
+    return f"https://api.schwabapi.com/v1/oauth/authorize?client_id={AF_APP_KEY}&redirect_uri={REDIRECT_URI}"
 
 def fetch_initial_token(auth_code):
     """Step 2: Trades the auth code for the first set of tokens."""
@@ -36,11 +40,12 @@ def fetch_initial_token(auth_code):
     if response.status_code == 200:
         tokens = response.json()
         tokens['fetched_at'] = time.time()
+        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
         with open(TOKEN_FILE, "w") as f:
             json.dump(tokens, f)
         return tokens
     else:
-        print("Error fetching initial token:", response.text)
+        print("Error fetching initial AF token:", response.text)
         return None
 
 def refresh_access_token(refresh_token):
@@ -65,27 +70,31 @@ def refresh_access_token(refresh_token):
         if 'refresh_token' not in new_tokens:
             new_tokens['refresh_token'] = refresh_token
             
+        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
         with open(TOKEN_FILE, "w") as f:
             json.dump(new_tokens, f)
         return new_tokens['access_token']
     else:
-        print("Failed to refresh token:", response.text)
+        print("Failed to refresh AF token:", response.text)
         return None
 
 def get_valid_access_token():
     """Loads the token, checks if it's expired, and refreshes it if necessary."""
     if not os.path.exists(TOKEN_FILE):
-        raise FileNotFoundError("Token file missing. You need to authenticate first.")
+        print("AF Token file missing. Needs authentication.")
+        return None
         
     with open(TOKEN_FILE, "r") as f:
         tokens = json.load(f)
         
     elapsed_time = time.time() - tokens.get('fetched_at', 0)
     if elapsed_time > (tokens.get('expires_in', 1800) - 60):
-        print("Token expired. Refreshing silently...")
+        print("AF Token expired. Refreshing silently...")
         return refresh_access_token(tokens['refresh_token'])
     
-    return tokens['access_token']
+    return tokens.get('access_token')
+
+# --- ACCOUNT AND TRADING SPECIFIC FUNCTIONS ---
 
 def get_account_data():
     """Fetches all linked accounts, balances, and current positions."""
@@ -93,12 +102,8 @@ def get_account_data():
     if not access_token:
         return None
         
-    # Schwab Trader API endpoint for accounts and positions
     accounts_url = "https://api.schwabapi.com/trader/v1/accounts?fields=positions"
-    
-    headers = {
-        "Authorization": f"Bearer {access_token}"
-    }
+    headers = {"Authorization": f"Bearer {access_token}"}
     
     response = requests.get(accounts_url, headers=headers)
     if response.status_code == 200:
@@ -114,17 +119,13 @@ def get_transactions(account_hash, start_date_iso, end_date_iso):
         return None
         
     transactions_url = f"https://api.schwabapi.com/trader/v1/accounts/{account_hash}/transactions"
-    
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json"
     }
-    
-    # Schwab requires exactly this format: 2026-01-01T00:00:00.000Z
     params = {
         "startDate": start_date_iso,
         "endDate": end_date_iso,
-#        "types": "TRADE" # Filters out dividend payouts, wire transfers, etc.
     }
     
     response = requests.get(transactions_url, headers=headers, params=params)
@@ -149,4 +150,3 @@ def get_account_hashes():
     else:
         print(f"Error fetching account hashes: {response.text}")
         return []
-        

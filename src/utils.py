@@ -1,3 +1,6 @@
+import streamlit as st
+from sqlmodel import create_engine
+import os
 from datetime import datetime, date
 
 def parse_occ_expiration(occ_string):
@@ -41,4 +44,15 @@ def parse_occ_type_and_strike(occ_string):
         return opt_type, strike
     except (ValueError, IndexError):
         return None, None
+
+@st.cache_resource
+def get_db_engine():
+    """
+    Creates and returns a globally cached SQLAlchemy/SQLModel engine.
+    This prevents Streamlit from opening hundreds of parallel SQLite connections.
+    """
+    db_url = "sqlite:///data/portfolio.db"
+    os.makedirs("data", exist_ok=True)
     
+    # check_same_thread=False is strictly required for SQLite in Streamlit
+    return create_engine(db_url, connect_args={"check_same_thread": False})    

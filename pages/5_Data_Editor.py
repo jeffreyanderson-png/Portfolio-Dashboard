@@ -1,86 +1,75 @@
-import os
-import sqlite3
 import streamlit as st
-import pandas as pd
+from sqlmodel import Session, select
+from src.models import Transaction
+from src.utils import get_db_engine
+from datetime import datetime
+from src.models import Campaign
 
-# --- 1. Database Connection Helper ---
-def get_db_connection():
-    db_file = os.path.join("data", "portfolio.db")
-    conn = sqlite3.connect(db_file)
-    conn.row_factory = sqlite3.Row
-    return conn
+# Retrieve the global engine (it will create it if it doesn't exist, or reuse the existing one)
+engine = get_db_engine()
 
-# --- 2. Load Data ---
-def load_trades():
-    conn = get_db_connection()
-    df = pd.read_sql_query('SELECT * FROM "transaction"', conn)
-    conn.close()
-    return df
+st.title("🗄️ Data Editor")
+st.markdown("---")
+st.write("Manual entry console for ledger adjustments, journaled shares, and non-API accounts (like Berkshire).")
 
-# --- 3. The Admin/Editor Interface ---
-def show_admin_page():
-    st.header("Database Management: Trades")
-    st.info("Make edits directly in the table below. Click 'Commit Changes' to save to the database.")
+with Session(engine) as session:
+    # Fetch campaigns so you can assign manual trades to active buckets
+    camps = session.exec(select(Campaign).where(Campaign.status == "Active")).all()
+    camp_dict = {c.name: c.id for c in camps}
+    camp_options = sorted(list(camp_dict.keys()))
 
-    if "current_trades" not in st.session_state:
-        st.session_state.current_trades = load_trades()
-
-    df = st.session_state.current_trades
-
-    edited_df = st.data_editor(
-        df,
-        num_rows="dynamic",
-        use_container_width=True,
-        key="trade_db_editor", 
-        hide_index=True
-    )
-
-    # --- 4. Commit Changes Logic ---
-    if st.button("Commit Changes", type="primary"):
-        changes = st.session_state["trade_db_editor"]
+    # Build the input form
+    with st.form("manual_entry_form", clear_on_submit=True):
+        st.subheader("Log New Transaction")
         
-        edited_rows = changes.get("edited_rows", {})
-        added_rows = changes.get("added_rows", [])
-        deleted_rows = changes.get("deleted_rows", []) 
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        try:
-            # Handle Deletions
-            if deleted_rows:
-                ids_to_delete = [int(df.iloc[idx]['id']) for idx in deleted_rows]
-                placeholders = ', '.join(['?'] * len(ids_to_delete))
-                cursor.execute(f'DELETE FROM "transaction" WHERE id IN ({placeholders})', ids_to_delete)
-
-            # Handle Edits
-            if edited_rows:
-                for idx, updates in edited_rows.items():
-                    trade_id = int(df.iloc[idx]['id'])
-                    set_clause = ', '.join([f"{col} = ?" for col in updates.keys()])
-                    values = list(updates.values())
-                    values.append(trade_id)
-                    cursor.execute(f'UPDATE "transaction" SET {set_clause} WHERE id = ?', values)
-
-            # Handle Additions
-            if added_rows:
-                for row in added_rows:
-                    columns = ', '.join(row.keys())
-                    placeholders = ', '.join(['?'] * len(row))
-                    values = list(row.values())
-                    cursor.execute(f'INSERT INTO "transaction" ({columns}) VALUES ({placeholders})', values)
-
-            conn.commit()
-            st.success("Database updated successfully!")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            exec_date = st.date_input("Execution Date", datetime.now().date())
+            root_ticker = st.text_input("Ticker (e.g., BRK.B)").upper()
+            asset_type = st.selectbox("Asset Type", ["EQUITY", "OPTION", "CASH", "FUTURE"])
             
-            st.session_state.current_trades = load_trades()
-            st.rerun()
-
-        except Exception as e:
-            conn.rollback()
-            st.error(f"Error updating database: {e}")
+        with col2:
+            action = st.selectbox("Action", ["BUY", "SELL", "JOURNAL", "DIVIDEND", "ASSIGNMENT"])
+            quantity = st.number_input("Quantity", value=0.0, format="%.4f")
+            price = st.number_input("Price per Share", value=0.0, format="%.4f")
             
-        finally:
-            conn.close()
+        with col3:
+            # Reminder to make cash outflows negative
+            amount = st.number_input("Net Amount (Cash Flow: Negative = Debit)", value=0.0, format="%.2f")
+            target_camp = st.selectbox("Assign to Campaign", ["None"] + camp_options)
+            broker = st.text_input("Broker/Account", value="Schwab - Berkshire")
 
-show_admin_page()
+        st.markdown("---")
+        submit_button = st.form_submit_button("Log Transaction", type="primary")
+
+        if submit_button:
+            if not root_ticker:
+                st.error("Ticker is required.")
+            elif action in ["BUY", "SELL"] and amount == 0.0:
+                st.warning("Did you forget to enter the Net Amount cash flow?")
+            else:
+                # Resolve the Campaign ID
+                c_id = camp_dict.get(target_camp) if target_camp != "None" else None
+
+                # Combine the date with the current time for the database timestamp
+                exec_dt = datetime.combine(exec_date, datetime.now().time())
+
+                # Create the record
+                new_tx = Transaction(
+                    exec_datetime=exec_dt,
+                    broker=broker,
+                    account_id=2, # Arbitrary ID for manual/Berkshire
+                    root_ticker=root_ticker,
+                    full_symbol=root_ticker, # Kept simple for manual entry
+                    asset_type=asset_type,
+                    action=action,
+                    quantity=quantity,
+                    price=price,
+                    fees=0.0,
+                    amount=amount,
+                    campaign_id=c_id
+                )
+                session.add(new_tx)
+                session.commit()
+                
+                st.success(f"✅ Successfully logged {action} of {quantity} {root_ticker}!")

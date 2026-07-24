@@ -2,6 +2,11 @@ from sqlmodel import SQLModel, Field, Relationship
 from typing import Optional, List
 from datetime import date, time, datetime
 
+# --- ADD THESE TWO LINES ---
+from sqlmodel.main import default_registry
+default_registry.dispose()
+# ---------------------------
+
 # --- 1. CONFIGURATION TABLES ---
 class Strategy(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
@@ -138,3 +143,19 @@ class RebalanceLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     rebalance_date: date
     notes: Optional[str] = None
+
+# --- 4. SYSTEM CONFIGURATION & LOGGING ---
+class AppConfig(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
+    config_key: str = Field(primary_key=True)
+    config_value: str
+    description: Optional[str] = None
+    last_updated: datetime = Field(default_factory=datetime.now)
+
+class SystemLog(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
+    id: Optional[int] = Field(default=None, primary_key=True)
+    timestamp: datetime = Field(default_factory=datetime.now, index=True)
+    level: str # 'INFO', 'WARNING', 'ERROR'
+    source: str # e.g., 'Schwab API', 'Database', 'Auth'
+    message: str

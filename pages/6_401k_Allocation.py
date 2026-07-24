@@ -1,13 +1,14 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import date, timedelta
-from src.schwab_api import get_latest_closes
+from datetime import timedelta
+from src.schwab_aw_api import get_latest_closes
+from src.utils import get_db_engine
 
-st.set_page_config(page_title="401k Allocation", layout="wide")
+# Retrieve the global engine (it will create it if it doesn't exist, or reuse the existing one)
+engine = get_db_engine()
 
 # --- MATH ENGINES ---
-
 def calculate_bond_allocation(slider_val):
     """Interpolates bond allocations across a 0-100 duration slider."""
     x_points = [0, 25, 50, 75, 100]
