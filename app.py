@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta
 from src.logger import get_config, set_config, log_event
 
-# Must be the very first Streamlit command
+# Must be the very first Streamlit command 
 st.set_page_config(page_title="Pilot Portfolio HUD", page_icon="✈️", layout="wide")
 
 # --- DEFINE NAVIGATION PAGES ---
