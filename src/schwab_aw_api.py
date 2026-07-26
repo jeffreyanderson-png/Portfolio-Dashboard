@@ -3,6 +3,7 @@ import json
 import requests
 import base64
 import time
+import concurrent.futures # IMPORT ADDED FOR MULTITHREADING
 from dotenv import load_dotenv, find_dotenv
 
 env_path = find_dotenv()
@@ -17,11 +18,9 @@ if not AW_APP_KEY:
     print("WARNING: Alpine Wind App Key not found. Check your .env file.")
 
 def get_auth_url():
-    """Step 1: Generates the login link for manual authentication."""
     return f"https://api.schwabapi.com/v1/oauth/authorize?client_id={AW_APP_KEY}&redirect_uri={REDIRECT_URI}"
 
 def fetch_initial_token(auth_code):
-    """Step 2: Trades the auth code for the first set of tokens."""
     token_url = "https://api.schwabapi.com/v1/oauth/token"
     auth_string = f"{AW_APP_KEY}:{AW_APP_SECRET}"
     encoded_auth = base64.b64encode(auth_string.encode()).decode()
@@ -49,7 +48,6 @@ def fetch_initial_token(auth_code):
         return None
 
 def refresh_access_token(refresh_token):
-    """Silently grabs a new access token using the 7-day refresh token."""
     token_url = "https://api.schwabapi.com/v1/oauth/token"
     auth_string = f"{AW_APP_KEY}:{AW_APP_SECRET}"
     encoded_auth = base64.b64encode(auth_string.encode()).decode()
@@ -79,9 +77,7 @@ def refresh_access_token(refresh_token):
         return None
 
 def get_valid_access_token():
-    """Loads the token, checks if it's expired, and refreshes it if necessary."""
     if not os.path.exists(TOKEN_FILE):
-        print("AW Token file missing. Needs authentication.")
         return None
         
     with open(TOKEN_FILE, "r") as f:
@@ -96,10 +92,10 @@ def get_valid_access_token():
 
 # --- MARKET DATA SPECIFIC FUNCTIONS ---
 
-def get_latest_closes(tickers: list):
-    """Fetches the latest closing price for a list of tickers."""
+def get_quotes(tickers: list):
+    """Fetches rich quote data for a list of tickers."""
     access_token = get_valid_access_token()
-    if not access_token:
+    if not access_token or not tickers:
         return {}
 
     symbol_string = ",".join(tickers)
@@ -112,10 +108,70 @@ def get_latest_closes(tickers: list):
         return {}
 
     data = response.json()
-    prices = {}
+    quotes = {}
     
     for symbol, details in data.items():
-        if 'quote' in details and 'closePrice' in details['quote']:
-            prices[symbol] = details['quote']['closePrice']
+        q = details.get('quote', {})
+        quotes[symbol] = {
+            "mark": q.get("mark"),
+            "close": q.get("closePrice"),
+            "open": q.get("openPrice"),
+            "high": q.get("highPrice"),
+            "low": q.get("lowPrice"),
+            "netChange": q.get("netChange"),
+            "52WkHigh": q.get("52WeekHigh"),
+            "52WkLow": q.get("52WeekLow")
+        }
             
-    return prices
+    return quotes
+
+def get_latest_closes(tickers: list):
+    """Backward-compatible wrapper function."""
+    quotes_data = get_quotes(tickers)
+    simple_prices = {}
+    for ticker, data in quotes_data.items():
+        if data.get("close"):
+            simple_prices[ticker] = data["close"]
+    return simple_prices
+
+# Helper function for the thread pool
+def _fetch_single_chain_iv(ticker, headers):
+    """Worker function to fetch a single ticker's IV."""
+    chains_url = f"https://api.schwabapi.com/marketdata/v1/chains?symbol={ticker}&strikeCount=1"
+    try:
+        response = requests.get(chains_url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            return ticker, data.get('volatility', None)
+        else:
+            return ticker, None
+    except Exception:
+        return ticker, None
+
+def get_implied_volatility(tickers: list):
+    """
+    Fetches the aggregate Implied Volatility for a list of tickers concurrently.
+    Returns a dictionary: {"SPY": 0.152, "AAPL": 0.221}
+    """
+    access_token = get_valid_access_token()
+    if not access_token or not tickers:
+        return {}
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    iv_data = {}
+    
+    # Use a ThreadPoolExecutor to fire requests concurrently.
+    # We cap max_workers at 10 to avoid slamming the Schwab API too hard.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # submit all tasks to the pool
+        future_to_ticker = {
+            executor.submit(_fetch_single_chain_iv, ticker, headers): ticker 
+            for ticker in tickers
+        }
+        
+        # As each task finishes, grab the result
+        for future in concurrent.futures.as_completed(future_to_ticker):
+            ticker, volatility = future.result()
+            iv_data[ticker] = volatility
+            
+    return iv_data

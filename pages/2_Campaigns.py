@@ -1,173 +1,275 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
-from sqlmodel import Session, select, update
+from sqlmodel import Session, select
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+
 from src.models import Campaign, Transaction
-from src.utils import get_db_engine
+from src.utils import get_db_engine, get_live_positions_dict, calculate_live_deployed_capital
+from src.schwab_af_api import get_account_data
 
-st.title("Campaign Manager")
-st.markdown("---")
-
-# Retrieve the global engine (it will create it if it doesn't exist, or reuse the existing one)
 engine = get_db_engine()
 
-# ADDED THE 4TH TAB HERE
-tab1, tab2, tab3, tab4 = st.tabs(["Active Campaigns", "Merge Campaigns", "Assign Strategies", "Split & Reassign"])
+st.title("🗂️ Campaign Management")
+st.markdown("---")
 
-with tab1:
-    st.subheader("Campaign Ledger")
-    with Session(engine) as session:
-        campaigns = session.exec(select(Campaign).where(Campaign.status == "Active")).all()
-        if campaigns:
-            camp_names = sorted([c.name for c in campaigns])
-            selected_camp = st.selectbox("Select a Campaign to inspect:", camp_names)
-            
-            if selected_camp:
-                camp = session.exec(select(Campaign).where(Campaign.name == selected_camp)).first()
-                st.write(f"**Strategy:** {camp.strategy} | **Start Date:** {camp.start_date} | **Total Transactions:** {len(camp.transactions)}")
+# ==========================================
+# DATABASE UTILITIES
+# ==========================================
+with st.expander("🛠️ Database Utilities (Merge Duplicates)"):
+    st.write("If you have duplicate campaigns for the same ticker (often caused by mixing CSV imports and API syncs), click below to merge them. All trades will be consolidated into the campaign that has an assigned strategy.")
+    if st.button("Merge Duplicate Campaigns", type="primary"):
+        with st.spinner("Merging duplicates..."):
+            with Session(engine) as session:
+                all_camps = session.exec(select(Campaign)).all()
                 
-                if camp.transactions:
-                    tx_data = [{
-                        "Date": tx.exec_datetime.strftime("%Y-%m-%d"),
-                        "Type": tx.asset_type,
-                        "Action": tx.action,
-                        "Symbol": tx.full_symbol,
-                        "Qty": tx.quantity,
-                        "Price": tx.price,
-                        "Amount": tx.amount
-                    } for tx in camp.transactions]
-                    st.dataframe(pd.DataFrame(tx_data), hide_index=True, use_container_width=True)
-        else:
-            st.info("No active campaigns found.")
+                camps_by_symbol = {}
+                for camp in all_camps:
+                    symbol = camp.name
+                    if camp.transactions:
+                        for tx in camp.transactions:
+                            if tx.root_ticker:
+                                symbol = tx.root_ticker
+                                break
+                    
+                    if symbol not in camps_by_symbol:
+                        camps_by_symbol[symbol] = []
+                    camps_by_symbol[symbol].append(camp)
+                
+                merge_count = 0
+                for sym, camp_list in camps_by_symbol.items():
+                    if len(camp_list) > 1:
+                        camp_list.sort(
+                            key=lambda c: (c.strategy is not None and c.strategy != "Unassigned", len(c.transactions)), 
+                            reverse=True
+                        )
+                        
+                        primary_camp = camp_list[0]
+                        duplicates = camp_list[1:]
+                        
+                        for dup in duplicates:
+                            for tx in dup.transactions:
+                                tx.campaign_id = primary_camp.id
+                                session.add(tx)
+                            session.delete(dup)
+                            merge_count += 1
+                
+                if merge_count > 0:
+                    session.commit()
+                    st.success(f"Successfully merged {merge_count} duplicate campaign(s)!")
+                    st.rerun()
+                else:
+                    st.info("No duplicates found. Your database is clean!")
 
-with tab2:
-    st.subheader("Merge Campaigns")
+tab_master, tab_orphans = st.tabs(["📊 Master Campaign List", "❓ Orphaned Transactions"])
+
+# ==========================================
+# TAB 1: MASTER CAMPAIGN LIST (Editable)
+# ==========================================
+with tab_master:
+    st.subheader("Assign Strategies & Manage Campaigns")
+    st.write("Double-click a cell in the **Strategy** column to quickly assign a strategy. Changes save automatically!")
+
+    with st.spinner("Establishing ground truth from Schwab..."):
+        try:
+            acct_data = get_account_data()
+            live_positions_dict = get_live_positions_dict(acct_data)
+        except Exception:
+            live_positions_dict = {}
+
     with Session(engine) as session:
-        all_camps = session.exec(select(Campaign)).all()
-        camp_options = sorted([c.name for c in all_camps])
-        merge_selection = st.multiselect("1. Select Campaigns to Merge:", options=camp_options)
-        new_name = st.text_input("2. New Unified Campaign Name:")
+        campaigns = session.exec(select(Campaign)).all()
         
-        if st.button("Execute Merge", type="primary"):
-            if len(merge_selection) > 1 and new_name:
-                new_camp = Campaign(name=new_name, start_date=datetime.now().date())
-                session.add(new_camp)
-                session.commit()
-                session.refresh(new_camp) 
-                
-                old_camps = session.exec(select(Campaign).where(Campaign.name.in_(merge_selection))).all()
-                old_camp_ids = [c.id for c in old_camps]
-                
-                session.exec(update(Transaction).where(Transaction.campaign_id.in_(old_camp_ids)).values(campaign_id=new_camp.id))
-                    
-                for old_camp in old_camps:
-                    session.delete(old_camp)
-                    
-                session.commit()
-                st.success(f"✅ Merged successfully into '{new_name}'!")
-                st.rerun()
+        camp_data = []
+        for camp in campaigns:
+            campaign_symbol = camp.name
+            if camp.transactions:
+                for tx in camp.transactions:
+                    if tx.root_ticker:
+                        campaign_symbol = tx.root_ticker
+                        break
+                        
+            if campaign_symbol in live_positions_dict:
+                display_status = "Active"
+                deployed_capital = calculate_live_deployed_capital(live_positions_dict[campaign_symbol])
             else:
-                st.warning("Select at least two campaigns and provide a name.")
-
-with tab3:
-    st.subheader("Tag Campaign Strategies")
-    st.write("Assign strategies to filter them onto the correct tracking dashboards.")
-    with Session(engine) as session:
-        camps_to_tag = session.exec(select(Campaign).where(Campaign.status == "Active")).all()
-        if camps_to_tag:
-            tag_col1, tag_col2 = st.columns([2, 1])
-            with tag_col1:
-                camps_selected = st.multiselect("Select Campaigns:", sorted([c.name for c in camps_to_tag]))
-            with tag_col2:
-                new_strategy = st.selectbox("Assign Strategy:", ["Wheel", "LEAP", "Calendar", "Spread", "Long Hold", "Unassigned"])
+                display_status = "Closed"
+                deployed_capital = 0.0
             
-            if st.button("Update Strategy", type="primary") and camps_selected:
-                for c_name in camps_selected:
-                    camp_obj = session.exec(select(Campaign).where(Campaign.name == c_name)).first()
-                    camp_obj.strategy = new_strategy
-                    session.add(camp_obj)
-                session.commit()
-                st.success("✅ Strategies updated!")
+            current_strategy = camp.strategy if camp.strategy else "Unassigned"
+
+            camp_data.append({
+                "ID": camp.id,
+                "Symbol": campaign_symbol,
+                "Status": display_status,
+                "Strategy": current_strategy,
+                "Deployed Capital": deployed_capital,
+                "Trade Count": len(camp.transactions)
+            })
+
+    if camp_data:
+        df_camps = pd.DataFrame(camp_data)
+        df_camps = df_camps.sort_values(by=["Status", "Deployed Capital"], ascending=[True, False])
+        
+        gb = GridOptionsBuilder.from_dataframe(df_camps)
+        gb.configure_column("ID", hide=True)
+        gb.configure_column("Deployed Capital", type=["numericColumn", "numberColumnFilter"], valueFormatter="x.toLocaleString('en-US', {style: 'currency', currency: 'USD'})")
+        
+        strategies = ["Unassigned", "Wheel", "LEAP", "Covered Call", "Credit Spread", "Iron Condor", "Buy & Hold", "Earnings Play", "Dividend Capture"]
+        gb.configure_column(
+            "Strategy", 
+            editable=True, 
+            cellEditor='agSelectCellEditor', 
+            cellEditorParams={'values': strategies},
+            cellStyle={'backgroundColor': '#1e3a8a', 'color': 'white'} 
+        )
+        
+        gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+        gb.configure_default_column(resizable=True, sortable=True, filter=True)
+        grid_options = gb.build()
+
+        grid_response = AgGrid(
+            df_camps,
+            gridOptions=grid_options,
+            update_mode=GridUpdateMode.VALUE_CHANGED,
+            data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+            fit_columns_on_grid_load=True,
+            theme='streamlit',
+            height=600
+        )
+
+        updated_df = grid_response['data']
+        
+        if updated_df is not None and not updated_df.empty:
+            merged_df = updated_df.merge(df_camps, on="ID", suffixes=('_new', '_old'))
+            changed_rows = merged_df[merged_df['Strategy_new'] != merged_df['Strategy_old']]
+            
+            if not changed_rows.empty:
+                with Session(engine) as session:
+                    for index, row in changed_rows.iterrows():
+                        camp_id = row['ID']
+                        new_strategy = row['Strategy_new']
+                        
+                        db_camp = session.get(Campaign, camp_id)
+                        if db_camp:
+                            db_camp.strategy = new_strategy
+                            session.add(db_camp)
+                    
+                    session.commit()
+                
+                st.success(f"Successfully updated {len(changed_rows)} campaign(s)!")
                 st.rerun()
 
-# --- NEW SPLIT & REASSIGN ENGINE ---
-with tab4:
-    st.subheader("Surgical Trade Splitter")
-    st.write("Select specific trades (like LEAPs or long-term holds) and kick them into a new campaign.")
+    else:
+        st.info("No campaigns found in the database.")
+
+
+# ==========================================
+# TAB 2: ORPHANED TRANSACTIONS
+# ==========================================
+with tab_orphans:
+    st.subheader("Orphaned Transactions Triage")
+    st.write("These transactions are not currently linked to any Campaign. Check the boxes to assign them.")
     
     with Session(engine) as session:
-        active_camps = session.exec(select(Campaign).where(Campaign.status == "Active")).all()
-        if active_camps:
-            camp_names = sorted([c.name for c in active_camps])
+        orphans = session.exec(select(Transaction).where(Transaction.campaign_id == None)).all()
+        
+        if not orphans:
+            st.success("Great job! All transactions are successfully linked to a campaign.")
+        else:
+            orphan_data = []
+            for tx in orphans:
+                orphan_data.append({
+                    "ID": tx.id,
+                    "Date": tx.exec_datetime.strftime("%Y-%m-%d") if tx.exec_datetime else "Unknown",
+                    "Asset": tx.asset_type,
+                    "Symbol": tx.full_symbol,
+                    "Instruction": tx.action,
+                    "Qty": tx.quantity,
+                    "Price": tx.price,
+                    "Amount": tx.amount
+                })
+                
+            df_orphans = pd.DataFrame(orphan_data)
+            gb_orph = GridOptionsBuilder.from_dataframe(df_orphans)
             
-            col1, col2 = st.columns(2)
-            with col1:
-                source_name = st.selectbox("1. Select Source Campaign:", camp_names)
-            with col2:
-                dest_input = st.text_input("2. Destination Campaign Name:", placeholder="e.g., ASTS LEAPs")
+            # Hide the ID column
+            gb_orph.configure_column("ID", hide=True)
+            
+            # Explicitly set checkboxes to appear on the Date column (the first visible column)
+            gb_orph.configure_column("Date", headerCheckboxSelection=True, checkboxSelection=True)
+            
+            gb_orph.configure_default_column(resizable=True, sortable=True, filter=True)
+            gb_orph.configure_column("Price", type=["numericColumn"], valueFormatter="x.toLocaleString('en-US', {style: 'currency', currency: 'USD'})")
+            gb_orph.configure_column("Amount", type=["numericColumn"], valueFormatter="x.toLocaleString('en-US', {style: 'currency', currency: 'USD'})")
+            
+            # Selection mode (we don't need use_checkbox=True here since we attached it directly to "Date" above)
+            gb_orph.configure_selection('multiple')
+            
+            grid_resp_orphans = AgGrid(
+                df_orphans,
+                gridOptions=gb_orph.build(),
+                update_mode=GridUpdateMode.SELECTION_CHANGED, 
+                fit_columns_on_grid_load=True,
+                theme='streamlit'
+            )
+            
+            # --- ASSIGNMENT UI ---
+            selected_rows = grid_resp_orphans.get('selected_rows', None)
+            
+            sel_ids = []
+            if selected_rows is not None and len(selected_rows) > 0:
+                if isinstance(selected_rows, pd.DataFrame):
+                    sel_ids = selected_rows['ID'].tolist()
+                else:
+                    sel_ids = [row['ID'] for row in selected_rows]
+            
+            if sel_ids:
+                st.markdown("### 🗃️ Assign Selected Transactions")
                 
-            if source_name:
-                source_camp = session.exec(select(Campaign).where(Campaign.name == source_name)).first()
+                all_camps = session.exec(select(Campaign).order_by(Campaign.name)).all()
+                camp_options = {f"{c.name} (ID: {c.id})": c.id for c in all_camps}
                 
-                # Build the data dictionary for the interactive editor
-                tx_list = []
-                for tx in source_camp.transactions:
-                    tx_list.append({
-                        "Move": False, # This becomes our checkbox
-                        "ID": tx.id,
-                        "Date": tx.exec_datetime.strftime("%Y-%m-%d"),
-                        "Action": tx.action,
-                        "Qty": tx.quantity,
-                        "Symbol": tx.full_symbol,
-                        "Amount": tx.amount
-                    })
-                    
-                if tx_list:
-                    st.write("**3. Select the exact trades to evict:**")
-                    df_tx = pd.DataFrame(tx_list)
-                    
-                    # Streamlit's native interactive dataframe!
-                    edited_df = st.data_editor(
-                        df_tx,
-                        hide_index=True,
-                        column_config={
-                            "Move": st.column_config.CheckboxColumn("Select", default=False),
-                            "ID": None, # Hide the ugly database ID from the UI
-                            "Amount": st.column_config.NumberColumn(format="$%.2f")
-                        },
-                        disabled=["Date", "Action", "Qty", "Symbol", "Amount"], # Lock everything except the checkbox
-                        use_container_width=True
-                    )
-                    
-                    # Extract the IDs of only the rows the user checked
-                    selected_ids = edited_df[edited_df["Move"] == True]["ID"].tolist()
-                    
-                    if st.button("Move Selected Trades", type="primary"):
-                        if not dest_input:
-                            st.warning("Please type a name for the Destination Campaign.")
-                        elif not selected_ids:
-                            st.warning("Check at least one box to move a trade.")
-                        elif dest_input == source_name:
-                            st.warning("You can't move trades into the exact same campaign!")
-                        else:
-                            # If the destination doesn't exist yet, build it dynamically!
-                            dest_camp = session.exec(select(Campaign).where(Campaign.name == dest_input)).first()
-                            if not dest_camp:
-                                dest_camp = Campaign(
-                                    name=dest_input, 
-                                    start_date=datetime.now().date(), 
-                                    strategy="Unassigned" # You can tag it as 'LEAP' later in Tab 3
-                                )
-                                session.add(dest_camp)
-                                session.commit()
-                                session.refresh(dest_camp)
-                            
-                            # Execute the bulk SQL update to swap the campaign IDs
-                            session.exec(
-                                update(Transaction)
-                                .where(Transaction.id.in_(selected_ids))
-                                .values(campaign_id=dest_camp.id)
-                            )
+                assign_mode = st.radio("Assignment Method:", ["Add to Existing Campaign", "Create New Campaign"], horizontal=True)
+                
+                if assign_mode == "Add to Existing Campaign":
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        chosen_camp = st.selectbox("Select Destination Campaign:", list(camp_options.keys()))
+                    with col2:
+                        st.write("") 
+                        st.write("") 
+                        if st.button("Link Selected", type="primary", use_container_width=True):
+                            camp_id = camp_options[chosen_camp]
+                            for tx_id in sel_ids:
+                                tx = session.get(Transaction, tx_id)
+                                if tx:
+                                    tx.campaign_id = camp_id
+                                    session.add(tx)
                             session.commit()
-                            st.success(f"✅ Teleported {len(selected_ids)} trades into '{dest_input}'!")
+                            st.success(f"Successfully linked {len(sel_ids)} transactions!")
                             st.rerun()
+                            
+                elif assign_mode == "Create New Campaign":
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        new_camp_name = st.text_input("Enter New Campaign Ticker/Name:")
+                    with col2:
+                        st.write("") 
+                        st.write("") 
+                        if st.button("Create & Link", type="primary", use_container_width=True):
+                            if new_camp_name:
+                                new_camp = Campaign(name=new_camp_name.upper(), strategy="Unassigned")
+                                session.add(new_camp)
+                                session.commit()
+                                session.refresh(new_camp)
+                                
+                                for tx_id in sel_ids:
+                                    tx = session.get(Transaction, tx_id)
+                                    if tx:
+                                        tx.campaign_id = new_camp.id
+                                        session.add(tx)
+                                session.commit()
+                                st.success(f"Created {new_camp_name.upper()} and linked {len(sel_ids)} transactions!")
+                                st.rerun()
+                            else:
+                                st.error("Please enter a campaign name.")

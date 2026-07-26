@@ -7,13 +7,13 @@ from src.schwab_af_api import get_transactions, get_account_hashes
 DB_URL = "sqlite:///data/portfolio.db"
 engine = create_engine(DB_URL)
 
-def run_incremental_sync(days_back=7):
+def run_incremental_sync(days_back=30):
     """Pulls recent trades and safely inserts only new ones, preventing duplicates."""
     account_hashes = get_account_hashes()
     if not account_hashes:
         return False, "Could not reach Schwab API. Check tokens."
 
-    # Define the 7-day rolling window
+    # Define the rolling window
     end_date = datetime.datetime.now(datetime.timezone.utc)
     start_date = end_date - datetime.timedelta(days=days_back)
     
@@ -32,7 +32,10 @@ def run_incremental_sync(days_back=7):
                 
             for trade in trades:
                 trade_type = trade.get('type', '')
-                if trade_type != 'TRADE':
+                
+                # --- THE FIX: Include Assignment/Expiration/Journal events ---
+                # RECEIVE_AND_DELIVER handles the "RAD" and "EXP" events from ToS
+                if trade_type not in ('TRADE', 'RECEIVE_AND_DELIVER', 'JOURNAL'):
                     continue
                 
                 exec_time_str = trade.get('time') or trade.get('transactionDate')
@@ -50,7 +53,12 @@ def run_incremental_sync(days_back=7):
                     if full_symbol == 'UNKNOWN':
                         continue
                         
-                    instruction = item.get('instruction', item.get('positionEffect', 'UNKNOWN'))
+                    # Better instruction capture for non-trades
+                    instruction = item.get('instruction', item.get('positionEffect', ''))
+                    if not instruction:
+                        # If no instruction (common for RADs), grab the helpful description!
+                        instruction = trade.get('description', 'UNKNOWN')
+                        
                     amount = item.get('amount', 0.0)
                     price = item.get('price', 0.0)
                     asset_type = instrument.get('assetType', 'UNKNOWN')
@@ -97,7 +105,7 @@ def run_incremental_sync(days_back=7):
                         session.commit()
                         session.refresh(campaign)
                     
-                    # --- INSERT NEW TRADE ---
+                    # --- INSERT NEW TRANSACTION ---
                     new_tx = Transaction(
                         exec_datetime=exec_dt,
                         broker="Schwab",
@@ -105,7 +113,7 @@ def run_incremental_sync(days_back=7):
                         root_ticker=root_ticker,
                         full_symbol=full_symbol,
                         asset_type=asset_type,
-                        action=instruction,
+                        action=instruction[:50], # Trim just in case the description is extremely long
                         quantity=amount,
                         price=price,
                         fees=0.0, 
@@ -116,4 +124,4 @@ def run_incremental_sync(days_back=7):
                     new_trade_count += 1
                     
         session.commit()
-        return True, f"Sync complete. Added {new_trade_count} new trades."
+        return True, f"Sync complete. Added {new_trade_count} new transactions."
