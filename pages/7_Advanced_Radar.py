@@ -89,7 +89,7 @@ with tab_threats:
                         "Live Price": st.column_config.NumberColumn(format="$%.2f")
                     },
                     hide_index=True,
-                    use_container_width=True
+                    width='stretch'
                 )
             else:
                 st.success("All clear! No short positions are currently testing their strikes (or they are too far gone to manage).")
@@ -217,7 +217,7 @@ with tab_ops:
                                 ),
                             },
                             hide_index=True, 
-                            use_container_width=True
+                            width='stretch'
                         )
                     else:
                         st.warning("No data returned for the watchlist. Check for typos in tickers.")

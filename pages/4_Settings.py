@@ -130,7 +130,7 @@ with tab2:
                     },
                     hide_index=True,
                     height=250, # Keeps the table compact
-                    use_container_width=True
+                    width='stretch'
                 )
                 
                 # Log export functionality

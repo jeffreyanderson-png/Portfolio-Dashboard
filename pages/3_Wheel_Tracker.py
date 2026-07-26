@@ -94,7 +94,7 @@ with Session(engine) as session:
                 "Adj Basis": st.column_config.NumberColumn("True Breakeven (Adj)", format="$%.2f")
             },
             hide_index=True,
-            use_container_width=True
+            width='stretch'
         )
         
         st.markdown("---")

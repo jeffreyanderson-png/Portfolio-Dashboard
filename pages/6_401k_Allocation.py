@@ -195,7 +195,7 @@ edited_df = st.data_editor(
         "Roth IRA": st.column_config.NumberColumn("Roth IRA Shares", step=1)
     },
     hide_index=True,
-    use_container_width=True
+    width='stretch'
 )
 
 st.divider()
@@ -223,5 +223,5 @@ styled_results = results_df.style\
     })\
     .map(highlight_drift, subset=['Drift %'])
 
-st.dataframe(styled_results, hide_index=True, use_container_width=True)
+st.dataframe(styled_results, hide_index=True, width='stretch')
 

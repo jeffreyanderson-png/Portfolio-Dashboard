@@ -1,9 +1,8 @@
 import streamlit as st
-import pandas as pd
 import json
 import time
 from datetime import datetime, timedelta
-from src.logger import get_config, set_config, log_event
+from src.logger import get_config, set_config
 
 # Must be the very first Streamlit command 
 st.set_page_config(page_title="Pilot Portfolio HUD", page_icon="✈️", layout="wide")
@@ -74,7 +73,7 @@ with st.sidebar:
                     
                     st.caption("2. Start Local Listener.")
                     
-                    if st.button("Start Local Listener", key="af_listener", type="primary", use_container_width=True):
+                    if st.button("Start Local Listener", key="af_listener", type="primary", width='stretch'):
                         with st.spinner("Waiting for Schwab authorization..."):
                             auth_code = capture_oauth_code(port=8080, timeout=120, use_https=True)
                             
@@ -107,7 +106,7 @@ with st.sidebar:
                     
                     st.caption("2. Start Local Listener.")
                     
-                    if st.button("Start Local Listener", key="aw_listener", type="primary", use_container_width=True):
+                    if st.button("Start Local Listener", key="aw_listener", type="primary", width='stretch'):
                         with st.spinner("Waiting for Schwab authorization..."):
                             auth_code = capture_oauth_code(port=8080, timeout=120, use_https=True)
                             
